@@ -6,7 +6,7 @@ import argparse
 import os
 import shutil
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,8 +39,12 @@ RUNTIME_FACTS = """\
 <environment>
 Tools: shell, read_file, write_file, edit_file.
 Workspace root: {workspace}
-All file paths are resolved relative to that root and may not escape it. Shell
-commands run with that root as their working directory.
+Your shell keeps its working directory between calls, like a real session: `cd sub`
+in one call applies to the next, and read_file/write_file/edit_file resolve relative
+paths against it too. Every shell result tells you where you are. It starts at the
+workspace root and cannot leave it. So to inspect a subproject, `cd` into it once
+and then work normally — `git diff`, `git log`, tests — instead of prefixing every
+command with the path.
 
 You act on files yourself. Use read_file to inspect, write_file to create or
 replace, edit_file to change part of a file. Never print a file's contents, a patch
@@ -83,6 +87,31 @@ class Config:
     compact: bool
     summary_model: str | None
     markdown: bool
+
+    # Mutable session state, not a flag: the shell's working directory, which
+    # persists between tool calls like a real shell session.
+    cwd: Path = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.cwd = self.workspace
+
+    def set_cwd(self, path: Path) -> bool:
+        """Move the session cwd. False if the path escaped the workspace."""
+        resolved = path.resolve()
+        if resolved != self.workspace and self.workspace not in resolved.parents:
+            self.cwd = self.workspace
+            return False
+        self.cwd = resolved
+        return True
+
+    @property
+    def cwd_label(self) -> str:
+        if self.cwd == self.workspace:
+            return "."
+        try:
+            return str(self.cwd.relative_to(self.workspace))
+        except ValueError:
+            return str(self.cwd)
 
     @property
     def compact_threshold(self) -> int:

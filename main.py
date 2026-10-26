@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import atexit
+import os
+import select
 import sys
 from pathlib import Path
 
@@ -29,6 +31,7 @@ commands
   /model [name]      show or switch model
   /prompt            show the active system prompt
   /history           message count in context
+  /cwd [dir]         show or set the shell's working directory
   /context           token usage vs the context window
   /compact           summarize history now
   /reset             clear conversation history
@@ -36,7 +39,8 @@ commands
   /limits            current output/timeout limits
   /exit, /quit       leave (Ctrl-D also works)
 input
-  <<<                start a multi-line message, end with a line containing >>>
+  paste              multi-line pastes are kept together as one message
+  <<<                type a multi-line message, end with a line containing >>>
   Ctrl-C             interrupt the running turn (kills any running command)
 """
 
@@ -59,6 +63,70 @@ def _save_history(readline, path: Path) -> None:
         readline.write_history_file(path)
     except OSError:
         pass
+
+
+# Terminals send a paste as one burst, so anything still buffered when input()
+# returns is the rest of that paste rather than a new message.
+PASTE_SETTLE = 0.05
+BRACKET_START = "\x1b[200~"
+BRACKET_END = "\x1b[201~"
+
+
+def drain_buffered(fd: int, settle: float = PASTE_SETTLE) -> str:
+    """Read input that is already waiting on fd. Empty string if there is none."""
+    chunks: list[str] = []
+    timeout = 0.0  # typed lines must not pay any latency for this
+    while True:
+        try:
+            ready, _, _ = select.select([fd], [], [], timeout)
+        except (OSError, ValueError):
+            break
+        if not ready:
+            break
+        try:
+            data = os.read(fd, 65536)
+        except OSError:
+            break
+        if not data:
+            break
+        chunks.append(data.decode("utf-8", errors="replace"))
+        timeout = settle  # a paste can arrive in several chunks
+    return "".join(chunks)
+
+
+def assemble_paste(first: str, rest: str, read_more=input) -> str:
+    """Join a first line with the buffered remainder of a paste."""
+    text = f"{first}\n{rest}"
+    for marker in (BRACKET_START, BRACKET_END):
+        text = text.replace(marker, "")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    if not text.endswith("\n"):
+        # The paste ended mid-line, so the user has not pressed Enter yet.
+        tail = lines.pop()
+        try:
+            tail += read_more()
+        except (EOFError, KeyboardInterrupt):
+            pass
+        lines.append(tail)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines)
+
+
+def read_message(prompt: str) -> str:
+    """One message from the user, pasted multi-line text included."""
+    first = input(prompt)
+    if first.strip() == "<<<" or not sys.stdin.isatty():
+        return first
+    rest = drain_buffered(sys.stdin.fileno())
+    if not rest.strip():
+        return first
+    message = assemble_paste(first, rest)
+    count = len(message.split("\n"))
+    if count > 1:
+        ui.info(f"({count} lines pasted)")
+    return message
 
 
 def read_multiline() -> str:
@@ -120,6 +188,15 @@ def handle_command(line: str, agent: Agent) -> bool:
     elif cmd == "reset":
         agent.reset()
         ui.info("history cleared")
+    elif cmd == "cwd":
+        if rest.strip():
+            target = (cfg.workspace / rest.strip()).resolve()
+            if not target.is_dir():
+                ui.warn(f"no such directory: {rest.strip()}")
+            elif not cfg.set_cwd(target):
+                ui.warn("outside the workspace, reset to the root")
+            agent.log.event("cwd_set", cwd=str(cfg.cwd))
+        ui.info(f"{cfg.cwd}  (workspace root: {cfg.workspace})")
     elif cmd == "log":
         ui.info(f"{cfg.log_path}  (session {agent.log.session_id})")
     elif cmd == "limits":
@@ -190,7 +267,7 @@ def main() -> int:
 
     while True:
         try:
-            line = input(ui.cyan("> "))
+            line = read_message(ui.cyan("> "))
         except EOFError:
             print()
             break
@@ -202,7 +279,8 @@ def main() -> int:
         line = line.strip()
         if not line:
             continue
-        if line.startswith("/"):
+        # A multi-line paste is a message, never a command, even if it opens with /.
+        if line.startswith("/") and "\n" not in line:
             if not handle_command(line, agent):
                 break
             continue

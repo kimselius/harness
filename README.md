@@ -128,6 +128,7 @@ Worth knowing:
 | `/model [name]` | show or switch model mid-session |
 | `/prompt` | print the active system prompt |
 | `/history` | message count in context |
+| `/cwd [dir]` | show or set the shell's working directory |
 | `/context` | token usage vs the window, plus the calibrated chars/token |
 | `/compact` | summarize history now |
 | `/reset` | clear conversation history |
@@ -135,7 +136,12 @@ Worth knowing:
 | `/limits` | current output limits and timeouts |
 | `/exit` | quit (Ctrl-D works too) |
 
-Type `<<<` to start a multi-line message and `>>>` on its own line to send it.
+Paste freely: a multi-line paste is kept together as one message rather than being
+chopped into one message per line. `input()` returns at the first newline, so the
+harness drains whatever the terminal still has buffered and reassembles it, which
+also normalizes CRLF and strips bracketed-paste markers. A paste that ends mid-line
+waits for you to press Enter. To type a multi-line message by hand, start with `<<<`
+and end with `>>>` on its own line.
 
 ## Interrupting
 
@@ -221,6 +227,28 @@ so nothing is written outside the checkout:
 Paths are resolved (symlinks included) and rejected if they fall outside the
 workspace.
 
+### The working directory persists
+
+The shell behaves like one session rather than a series of unrelated commands: `cd
+sub` in one call applies to every later call, and `read_file`/`write_file`/
+`edit_file` resolve relative paths against the same directory. So working on a
+subproject is what you would expect —
+
+```
+cd repo                    → cwd: repo
+git diff --stat            → runs in repo, no path prefix needed
+read_file f.txt            → reads repo/f.txt
+```
+
+— instead of prefixing every command with the path or wrapping everything in
+`cd x && …`. Each shell result reports where it is (`exit code: 0 · cwd: repo`), and
+the directory is read back from the real `pwd` after the command, so `cd` inside a
+compound command sticks too.
+
+It cannot leave the workspace: a command that ends up outside resets to the root and
+says so. If the directory is deleted underneath it, the next command falls back to
+the root rather than failing. `/cwd` shows it and `/cwd sub` sets it by hand.
+
 ## Output limits
 
 Tool results handed to the model are clamped to ~6000 chars / 250 lines, keeping the
@@ -279,7 +307,7 @@ One JSON object per line, with `ts`, `session`, `seq`, `type`. Types:
 `llm_response` (content, tool calls, usage), `tool_call`, `tool_result` (full
 output, duration, truncation flag), `compaction` (token counts before/after plus
 the summary text), `compaction_error`, `compaction_skipped`, `tool_result_shrunk`,
-`history_trimmed`, `history_repaired`, `interrupted` (with `where`:
+`history_trimmed`, `history_repaired`, `cwd_set`, `interrupted` (with `where`:
 `request`/`stream`/`tool`/`turn`), `pasted_code_block`, `llm_error`,
 `max_steps_reached`, `session_end`.
 
@@ -307,6 +335,8 @@ network:
 .venv/bin/python tests/test_compaction.py
 .venv/bin/python tests/test_markdown.py
 .venv/bin/python tests/test_interrupt.py
+.venv/bin/python tests/test_cwd.py
+.venv/bin/python tests/test_paste.py
 ```
 
 `test_harness.py` covers the tool loop in streaming and non-streaming mode,
@@ -328,6 +358,15 @@ leaves no orphaned children (verified with `pgrep`), that unrun calls of the
 interrupted round are still answered, that partial stream text survives while
 half-built tool calls do not, that the session keeps working afterwards, and that
 the tool-use contract survives a custom `PROMPT.md`.
+
+`test_cwd.py` covers directory persistence across calls, `cd` inside compound
+commands, clamping on escape, a deleted working directory, the file tools following
+the cwd, the invisible `pwd` probe (including commands with no trailing newline),
+and a real `git init` / `git diff` in a child directory.
+
+`test_paste.py` drives the actual REPL through a pty and checks that a three-line
+paste arrives as one user message, that single lines still produce separate turns,
+and that slash commands are unaffected.
 
 ## Layout
 

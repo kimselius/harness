@@ -18,15 +18,28 @@ from util import ToolError, ToolInterrupted, display_path, resolve_in_workspace
 
 MAX_READ_BYTES = 20 * 1024 * 1024
 
+# Appended to every shell command so the final working directory can be read back
+# and carried into the next call, the way a real shell session behaves.
+CWD_MARKER = "__harness_cwd_6b1f__:"
+# The leading newline matters: without it the marker is glued to the last line of
+# output whenever a command does not end with one (`printf` without \n).
+CWD_PROBE = (
+    f'\n__harness_rc=$?\nprintf "\\n%s%s\\n" "{CWD_MARKER}" "$(pwd)"\n'
+    "exit $__harness_rc\n"
+)
+
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
             "name": "shell",
             "description": (
-                "Run a shell command (/bin/sh -c) in the workspace root. Returns the "
-                "exit code plus combined stdout/stderr. Use it for listing, searching, "
-                "running tests, installing packages, and anything else system level."
+                "Run a shell command (/bin/sh -c). Returns the exit code, the current "
+                "directory, and combined stdout/stderr. Use it for listing, searching, "
+                "git, running tests, installing packages, and anything else system "
+                "level. The working directory persists between calls: `cd sub` in one "
+                "call applies to every later call, and the file tools follow it too. "
+                "It starts at the workspace root and cannot leave it."
             ),
             "parameters": {
                 "type": "object",
@@ -57,7 +70,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "File path, relative to the workspace root.",
+                        "description": (
+                            "File path. Relative paths resolve against the "
+                            "shell's current directory and may not escape the "
+                            "workspace root."
+                        ),
                     },
                     "offset": {
                         "type": "integer",
@@ -86,7 +103,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "File path, relative to the workspace root.",
+                        "description": (
+                            "File path. Relative paths resolve against the "
+                            "shell's current directory and may not escape the "
+                            "workspace root."
+                        ),
                     },
                     "content": {
                         "type": "string",
@@ -111,7 +132,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "File path, relative to the workspace root.",
+                        "description": (
+                            "File path. Relative paths resolve against the "
+                            "shell's current directory and may not escape the "
+                            "workspace root."
+                        ),
                     },
                     "old_string": {
                         "type": "string",
@@ -170,9 +195,9 @@ def tool_shell(args: dict, cfg: Config) -> str:
         timeout = min(float(requested), cfg.max_shell_timeout)
 
     proc = subprocess.Popen(
-        command,
+        command + CWD_PROBE,
         shell=True,
-        cwd=str(cfg.workspace),
+        cwd=str(cfg.cwd if cfg.cwd.is_dir() else cfg.workspace),
         env=cfg.child_env(),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -192,19 +217,41 @@ def tool_shell(args: dict, cfg: Config) -> str:
         # reached it. Kill it here or it keeps running after the turn is gone.
         _kill_group(proc)
         output, _ = proc.communicate()
-        raise ToolInterrupted(partial=(output or "").rstrip("\n")) from None
+        partial, _ = _take_cwd(output or "", cfg)
+        raise ToolInterrupted(partial=partial.rstrip("\n")) from None
 
+    output, notes = _take_cwd(output or "", cfg)
     status = (
         f"timed out after {timeout:g}s (process group killed)"
         if timed_out
         else f"exit code: {proc.returncode}"
     )
     body = output.rstrip("\n") if output.strip() else "(no output)"
-    return f"{status}\n--- output ---\n{body}"
+    extra = f" ({'; '.join(notes)})" if notes else ""
+    return f"{status} · cwd: {cfg.cwd_label}{extra}\n--- output ---\n{body}"
+
+
+def _take_cwd(output: str, cfg: Config) -> tuple[str, list[str]]:
+    """Strip the cwd probe from the output and apply it to the session.
+
+    The probe is missing when the command exits early (`exit 1`), was killed, or
+    failed to parse. In that case the directory simply does not change.
+    """
+    notes: list[str] = []
+    at = output.rfind(CWD_MARKER)
+    if at == -1:
+        return output, notes
+    head = output[:at]
+    if head.endswith("\n"):  # the newline the probe itself printed
+        head = head[:-1]
+    reported = output[at + len(CWD_MARKER) :].split("\n", 1)[0].strip()
+    if reported and not cfg.set_cwd(Path(reported)):
+        notes.append("left the workspace, directory reset to the root")
+    return head, notes
 
 
 def tool_read_file(args: dict, cfg: Config) -> str:
-    path = resolve_in_workspace(cfg.workspace, _require_str(args, "path"))
+    path = resolve_in_workspace(cfg.workspace, _require_str(args, "path"), cfg.cwd)
     text = _read_text(path)
     lines = text.splitlines()
 
@@ -233,7 +280,7 @@ def tool_read_file(args: dict, cfg: Config) -> str:
 
 
 def tool_write_file(args: dict, cfg: Config) -> str:
-    path = resolve_in_workspace(cfg.workspace, _require_str(args, "path"))
+    path = resolve_in_workspace(cfg.workspace, _require_str(args, "path"), cfg.cwd)
     content = _require_str(args, "content")
     if path.is_dir():
         raise ToolError(f"{path} is a directory")
@@ -248,7 +295,7 @@ def tool_write_file(args: dict, cfg: Config) -> str:
 
 
 def tool_edit_file(args: dict, cfg: Config) -> str:
-    path = resolve_in_workspace(cfg.workspace, _require_str(args, "path"))
+    path = resolve_in_workspace(cfg.workspace, _require_str(args, "path"), cfg.cwd)
     old = _require_str(args, "old_string")
     new = _require_str(args, "new_string")
     replace_all = bool(args.get("replace_all", False))

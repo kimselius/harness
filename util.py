@@ -53,14 +53,19 @@ def truncate(text: str, max_chars: int, max_lines: int) -> tuple[str, str | None
     return f"{text}\n{note}", note
 
 
-def resolve_in_workspace(root: Path, raw: str) -> Path:
-    """Resolve a model-supplied path, refusing anything outside the workspace."""
+def resolve_in_workspace(root: Path, raw: str, base: Path | None = None) -> Path:
+    """Resolve a model-supplied path, refusing anything outside the workspace.
+
+    Relative paths resolve against `base` (the session's working directory) and
+    fall back to the workspace root.
+    """
     if not raw or not raw.strip():
         raise ToolError("path must not be empty")
     root = root.resolve()
+    start = (base or root).resolve()
     candidate = Path(raw.strip()).expanduser()
     if not candidate.is_absolute():
-        candidate = root / candidate
+        candidate = start / candidate
     resolved = candidate.resolve()
     if resolved != root and root not in resolved.parents:
         raise ToolError(
