@@ -31,6 +31,47 @@ Any OpenAI-compatible endpoint works:
 
 ### In a container
 
+Two ways, both kept because they suit different habits:
+
+| | `docker run` one-liner | `Dockerfile` image |
+| --- | --- | --- |
+| setup | none | `docker build` once |
+| startup | pip install every launch | instant |
+| tooling | whatever the base image has | `curl git jq ripgrep less procps` baked in |
+| source edits | live, it's a mount | rebuild |
+| best for | one-offs, trying it out | repeated use, servers |
+
+#### Build an image
+
+```sh
+docker build -t harness .
+docker run -it --rm \
+  -v "$PWD/workspace":/ws \
+  -v "$PWD/logs":/logs \
+  --env-file .env \
+  -e HARNESS_WORKSPACE=/ws \
+  -e HARNESS_LOG_DIR=/logs \
+  --memory 2g --cpus 2 --pids-limit 512 \
+  harness
+```
+
+Ubuntu 24.04 with `python3`, plus the tools an agent reaches for constantly. The
+entrypoint is `main.py`, so a bare run opens the REPL and `harness -p "do a thing"`
+is a one-shot. Nothing is mounted over the source, so the agent's edits to the
+harness itself die with the container.
+
+Without those two `-v` mounts, the workspace and transcripts live inside the
+container and `--rm` throws them away. Your `PROMPT.md` is baked in at build time;
+to iterate on it without rebuilding, mount it:
+`-v "$PWD/PROMPT.md":/harness/PROMPT.md:ro`.
+
+To harden further, add `--read-only --tmpfs /tmp:rw,size=256m`. Everything the
+harness needs is already installed, so only `/tmp` and the two mounts stay writable
+— at the cost of the agent no longer being able to `apt-get install` or `pip
+install` anything mid-session.
+
+#### Just docker run
+
 No image to build. The source goes in read-only and only the workspace and logs are
 writable, so the agent cannot edit the harness that runs it:
 
@@ -60,24 +101,9 @@ For a one-shot, extend the inner command — flags go to `main.py`, not to
   sh -c "pip install -q -r requirements.txt && python main.py -p 'list the files'"
 ```
 
-Prefer Ubuntu and the usual agent tooling? Same shape, slower start, since apt runs
-on every launch:
-
-```sh
-docker run -it --rm \
-  -v "$PWD":/harness:ro \
-  -v "$PWD/workspace":/ws \
-  -v "$PWD/logs":/logs \
-  -w /harness \
-  --env-file .env \
-  -e HARNESS_WORKSPACE=/ws \
-  -e HARNESS_LOG_DIR=/logs \
-  ubuntu:24.04 \
-  sh -c "apt-get update -qq \
-         && apt-get install -y -qq python3-pip curl git jq ripgrep \
-         && pip install -q --break-system-packages -r requirements.txt \
-         && python3 main.py"
-```
+`python:3.13-slim` has bash and coreutils but no `curl`, `git` or `ripgrep`. You can
+apt-install them in the inner command, but that runs on every launch — if you want
+them, build the image instead.
 
 Worth knowing:
 
@@ -91,10 +117,7 @@ Worth knowing:
   `OPENAI_API_KEY="sk-..."`. Comments need their own line.
 - A model server on the host is not reachable at `localhost` from inside the
   container; use `http://host.docker.internal:11434/v1` (Docker Desktop) or
-  `--network host` on Linux.
-
-A `Dockerfile` would only buy a faster start and pre-baked tools; it is not needed
-to run this.
+  `--network host` on Linux. Applies to the built image too.
 
 ### REPL commands
 
