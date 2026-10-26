@@ -1,0 +1,84 @@
+# --- harness runtime: local state, never commit -----------------------------
+# Credentials and endpoint config. .env.example is the tracked template.
+.env
+.env.*
+!.env.example
+
+# JSONL session transcripts: they hold full file contents and command output,
+# so they can easily contain secrets.
+logs/
+
+# The agent's scratch directory.
+workspace/
+
+# REPL line history.
+.harness_history
+
+# Local system prompt. PROMPT.md.example is tracked; commit your own with
+# `git add -f PROMPT.md` if you want it versioned.
+PROMPT.md
+
+# --- python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# virtualenvs
+.venv/
+venv/
+env/
+ENV/
+
+# packaging and build output
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+MANIFEST
+
+# test, lint and type-checker caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+.pytype/
+.pyre/
+.tox/
+.nox/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# notebooks
+.ipynb_checkpoints/
+
+# --- editors and tooling ----------------------------------------------------
+.vscode/
+.idea/
+*.sublime-workspace
+.direnv/
+.envrc
+.claude/settings.local.json
+*.swp
+*.swo
+*~
+
+# --- os ---------------------------------------------------------------------
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
+
+# --- misc -------------------------------------------------------------------
+*.bak
+*.tmp
+*.orig
+*.rej
+core
