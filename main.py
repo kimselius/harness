@@ -9,10 +9,11 @@ import select
 import sys
 from pathlib import Path
 
+import sessions
 import tools as toolkit
 import ui
 from agent import Agent
-from config import Config, build_parser, config_from_args, load_dotenv
+from config import BASE_DIR, Config, build_parser, config_from_args, load_dotenv
 from logbook import Logbook
 
 
@@ -36,6 +37,8 @@ commands
   /compact           summarize history now
   /reset             clear conversation history
   /log               path to the JSONL session log
+  /sessions          list recorded sessions
+  /resume <id>       load an earlier session (id, prefix, or "last")
   /limits            current output/timeout limits
   /exit, /quit       leave (Ctrl-D also works)
 input
@@ -199,6 +202,24 @@ def handle_command(line: str, agent: Agent) -> bool:
         ui.info(f"{cfg.cwd}  (workspace root: {cfg.workspace})")
     elif cmd == "log":
         ui.info(f"{cfg.log_path}  (session {agent.log.session_id})")
+    elif cmd == "sessions":
+        list_sessions(cfg.log_path.parent)
+    elif cmd == "resume":
+        if not rest.strip():
+            ui.warn("usage: /resume <session-id|last>")
+        else:
+            try:
+                path = sessions.resolve(cfg.log_path.parent, rest.strip())
+            except sessions.SessionError as exc:
+                ui.warn(str(exc))
+                return True
+            if path == cfg.log_path:
+                ui.info("already in that session")
+                return True
+            agent.attach_log(Logbook(path))
+            cfg.log_path = path
+            agent.log.session_start(cfg, resumed=True)
+            restore(agent)
     elif cmd == "limits":
         ui.info(
             f"output: {cfg.max_output_chars} chars / {cfg.max_output_lines} lines · "
@@ -233,13 +254,59 @@ def run_turn(agent: Agent, message: str) -> None:
     ui.info(f"  [{cfg.model}] " + " · ".join(parts))
 
 
+def list_sessions(log_dir: Path, limit: int = 20) -> None:
+    files = sessions.session_files(log_dir)
+    if not files:
+        ui.info(f"no sessions in {log_dir}")
+        return
+    for path in files[:limit]:
+        print(sessions.format_row(sessions.summarize(path)))
+    if len(files) > limit:
+        ui.info(f"… and {len(files) - limit} older")
+
+
+def restore(agent: Agent) -> None:
+    """Load an earlier session's conversation into the agent."""
+    cfg = agent.cfg
+    history, stats = sessions.load_history(
+        cfg.log_path, cfg.max_output_chars, cfg.max_output_lines
+    )
+    agent.history = history
+    # A killed process can leave tool calls unanswered; make the history valid.
+    agent.repair_history(reason="not recorded in the session log")
+    if history:
+        agent.history.append({"role": "user", "content": sessions.context.RESUME_NOTE})
+    agent.log.event(
+        "session_restored",
+        messages=len(agent.history),
+        tokens=agent.used_tokens(),
+        **stats,
+    )
+    ui.info(
+        f"resumed {cfg.log_path.stem}: {len(agent.history)} messages, "
+        f"~{agent.used_tokens()} tokens"
+        + (
+            f", {stats['compactions_applied']} compactions replayed"
+            if stats["compactions_applied"]
+            else ""
+        )
+    )
+
+
 def main() -> int:
     load_dotenv()
     args = build_parser().parse_args()
+    if args.sessions:
+        list_sessions(Path(args.log_dir).expanduser()
+                      if Path(args.log_dir).is_absolute()
+                      else (BASE_DIR / args.log_dir))
+        return 0
     cfg = config_from_args(args)
     log = Logbook(cfg.log_path)
-    log.session_start(cfg)
+    log.session_start(cfg, resumed=cfg.resumed)
     agent = Agent(cfg, log)
+    if cfg.resumed:
+        restore(agent)
 
     # One-shot: -p flag, or a message piped on stdin.
     oneshot = args.prompt

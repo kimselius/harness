@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import os
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import sessions
 
 # Hard cap per logged string, so a runaway command cannot produce a 2 GB log.
 MAX_FIELD_CHARS = 1_000_000
@@ -33,8 +34,10 @@ class Logbook:
                 f"Cannot create log directory {self.path.parent}: {exc.strerror}. "
                 "Pass --log-dir with a writable path."
             ) from None
-        self.session_id = uuid.uuid4().hex[:12]
-        self._seq = 0
+        # The filename *is* the session id, and a resumed session keeps appending
+        # to its own file, so seq numbering has to continue where it left off.
+        self.session_id = path.stem
+        self._seq = sessions.last_seq(path)
 
     def event(self, kind: str, **fields: Any) -> None:
         self._seq += 1
@@ -49,9 +52,9 @@ class Logbook:
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
 
-    def session_start(self, cfg: Any) -> None:
+    def session_start(self, cfg: Any, resumed: bool = False) -> None:
         self.event(
-            "session_start",
+            "session_resumed" if resumed else "session_start",
             model=cfg.model,
             base_url=cfg.base_url,
             workspace=str(cfg.workspace),

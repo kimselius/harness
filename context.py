@@ -36,6 +36,34 @@ superseded intermediate attempts. Prefer short lines over prose.
 
 SUMMARY_HEADER = "[context summary of the earlier part of this session]"
 
+# Used when the summary call itself fails: better to drop the old messages with a
+# marker than to overflow the window.
+SUMMARY_FALLBACK = (
+    "(summary unavailable: earlier messages were dropped to stay within the "
+    "context window; ask the user if you need details)"
+)
+
+# Harness-authored messages. They live here because session replay has to be able
+# to reinsert them without importing the agent loop.
+INTERRUPT_NOTE = (
+    "[harness] The user interrupted you. Whatever you were doing was stopped, and "
+    "any command still running was killed. Do not resume it. Wait for new "
+    "instructions."
+)
+
+
+def step_limit_note(max_steps: int) -> str:
+    return (
+        f"[harness] Step limit ({max_steps}) reached. Stop calling tools and "
+        "summarize what you did and what is left."
+    )
+
+
+RESUME_NOTE = (
+    "[harness] This session was resumed in a new process. Everything above is "
+    "earlier history, so do not assume a command you ran before is still running."
+)
+
 
 class TokenMeter:
     """Character-based token estimator, calibrated from server usage reports."""

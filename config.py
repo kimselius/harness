@@ -7,8 +7,9 @@ import os
 import shutil
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
+
+import sessions
 
 # Env vars that must not leak into shell commands the model runs.
 SECRET_ENV_PREFIXES = ("OPENAI_", "HARNESS_", "ANTHROPIC_")
@@ -81,6 +82,7 @@ class Config:
     max_tokens: int | None
     request_timeout: float
     prompt_file: Path
+    resumed: bool
     context_tokens: int
     compact_at: float
     compact_keep: float
@@ -218,6 +220,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="System prompt file; used if it exists (default: ./PROMPT.md).",
     )
     p.add_argument(
+        "--resume",
+        nargs="?",
+        const="last",
+        default=None,
+        metavar="SESSION",
+        help=(
+            "Continue an earlier session: its id, an unambiguous prefix, a path to "
+            "the log, or nothing for the most recent one. New events append to that "
+            "session's log."
+        ),
+    )
+    p.add_argument(
+        "--sessions",
+        action="store_true",
+        help="List recorded sessions and exit.",
+    )
+    p.add_argument(
         "--log-dir",
         default=os.getenv("HARNESS_LOG_DIR", "logs"),
         help="Directory for the JSONL transcript (default: ./logs).",
@@ -330,8 +349,16 @@ def config_from_args(args: argparse.Namespace) -> Config:
                 "--base-url for a local server."
             )
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    log_path = anchor(args.log_dir) / f"session-{stamp}.jsonl"
+    log_dir = anchor(args.log_dir)
+    resumed = False
+    if args.resume is not None:
+        try:
+            log_path = sessions.resolve(log_dir, args.resume)
+        except sessions.SessionError as exc:
+            sys.exit(f"{exc}")
+        resumed = True
+    else:
+        log_path = log_dir / f"{sessions.new_id()}{sessions.SESSION_SUFFIX}"
 
     return Config(
         model=args.model,
@@ -349,6 +376,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         max_tokens=args.max_tokens,
         request_timeout=args.request_timeout,
         prompt_file=anchor(args.prompt_file),
+        resumed=resumed,
         context_tokens=max(2000, args.context_tokens),
         compact_at=min(0.95, max(0.3, args.compact_at)),
         compact_keep=min(0.6, max(0.05, args.compact_keep)),

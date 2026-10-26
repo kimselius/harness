@@ -133,6 +133,8 @@ Worth knowing:
 | `/compact` | summarize history now |
 | `/reset` | clear conversation history |
 | `/log` | path to this session's JSONL log |
+| `/sessions` | list recorded sessions |
+| `/resume <id>` | load an earlier session (id, prefix, or `last`) |
 | `/limits` | current output limits and timeouts |
 | `/exit` | quit (Ctrl-D works too) |
 
@@ -142,6 +144,39 @@ harness drains whatever the terminal still has buffered and reassembles it, whic
 also normalizes CRLF and strips bracketed-paste markers. A paste that ends mid-line
 waits for you to press Enter. To type a multi-line message by hand, start with `<<<`
 and end with `>>>` on its own line.
+
+## Sessions
+
+Every run is a session with an id like `20261026-105057-b1c53e`, and its log is
+`logs/<id>.jsonl` — the filename *is* the id.
+
+```sh
+.venv/bin/python main.py --sessions            # list them
+.venv/bin/python main.py --resume              # continue the most recent
+.venv/bin/python main.py --resume 20261026-105057-b1c53e
+.venv/bin/python main.py --resume 20261026-10  # unambiguous prefix is enough
+```
+
+Resuming replays the conversation from the log and appends new events to that same
+file, so one session stays one file however many times you come back to it.
+`seq` numbering continues where it stopped. In the REPL, `/sessions` lists and
+`/resume <id>` switches without restarting.
+
+The log is the only state, so a session survives the process being killed:
+
+- A half-written final line (a `kill -9` mid-write) is skipped.
+- Tool calls with no recorded result are answered with an error on load, so the
+  replayed history is valid for strict APIs.
+- Tool output is re-truncated with your *current* limits rather than stored twice,
+  so lowering `--max-output-chars` shrinks a resumed session's context too.
+- Recorded compactions are replayed, so a session that compacted three times comes
+  back at its compacted size instead of re-expanding to everything.
+- A note is appended telling the model it is a new process, so it does not assume a
+  command it started earlier is still running.
+
+What is *not* restored: the shell's working directory (back to the workspace root)
+and anything the earlier process had in memory. Files in `workspace/` are untouched,
+since they live on disk.
 
 ## Interrupting
 
@@ -303,7 +338,7 @@ overflowing the window.
 ## Log format
 
 One JSON object per line, with `ts`, `session`, `seq`, `type`. Types:
-`session_start`, `user_message`, `llm_request` (full message array sent),
+`session_start`, `session_resumed`, `session_restored`, `user_message`, `llm_request` (full message array sent),
 `llm_response` (content, tool calls, usage), `tool_call`, `tool_result` (full
 output, duration, truncation flag), `compaction` (token counts before/after plus
 the summary text), `compaction_error`, `compaction_skipped`, `tool_result_shrunk`,
@@ -337,6 +372,7 @@ network:
 .venv/bin/python tests/test_interrupt.py
 .venv/bin/python tests/test_cwd.py
 .venv/bin/python tests/test_paste.py
+.venv/bin/python tests/test_sessions.py
 ```
 
 `test_harness.py` covers the tool loop in streaming and non-streaming mode,
@@ -364,6 +400,11 @@ commands, clamping on escape, a deleted working directory, the file tools follow
 the cwd, the invisible `pwd` probe (including commands with no trailing newline),
 and a real `git init` / `git diff` in a child directory.
 
+`test_sessions.py` covers id generation, one-file-per-session, reference resolution
+(`last`, exact, prefix, path, ambiguous, missing), replay fidelity against a live
+history, re-truncation on load, compaction replay, a killed session with a damaged
+line and an unanswered tool call, and `--resume`/`--sessions` as subprocesses.
+
 `test_paste.py` drives the actual REPL through a pty and checks that a three-line
 paste arrives as one user message, that single lines still produce separate turns,
 and that slash commands are unaffected.
@@ -375,7 +416,8 @@ main.py      CLI + REPL
 agent.py     tool loop, truncation, compaction, history repair
 llm.py       OpenAI-compatible client (streaming + non-streaming)
 tools.py     shell / read_file / write_file / edit_file + JSON schemas
-context.py   token metering, split points, summary prompt
+context.py   token metering, split points, summary prompt, harness notes
+sessions.py  session discovery, listing, replay from the log
 markdown.py  markdown to ANSI, streaming and whole-string
 config.py    flags, env, .env loading, system prompt assembly
 logbook.py   JSONL writer

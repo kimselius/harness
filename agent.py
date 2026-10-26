@@ -13,13 +13,8 @@ import ui
 from config import Config
 from llm import LLM
 from logbook import Logbook
+from context import INTERRUPT_NOTE, SUMMARY_FALLBACK, step_limit_note
 from util import ToolError, ToolInterrupted, truncate
-
-INTERRUPT_NOTE = (
-    "[harness] The user interrupted you. Whatever you were doing was stopped, and "
-    "any command still running was killed. Do not resume it. Wait for new "
-    "instructions."
-)
 
 
 class _Printer:
@@ -73,6 +68,11 @@ class Agent:
         self.meter = context.TokenMeter(toolkit.TOOL_SCHEMAS)
         self.compactions = 0
         self.interrupted = False
+
+    def attach_log(self, log: Logbook) -> None:
+        """Point the agent and its client at another session's log."""
+        self.log = log
+        self.llm.log = log
 
     # -- history -----------------------------------------------------------
     def reset(self) -> None:
@@ -147,13 +147,7 @@ class Agent:
             self.history = [context.summary_message(summary), *tail]
         else:
             # Summarizing failed; drop the head rather than overflow the window.
-            self.history = [
-                context.summary_message(
-                    "(summary unavailable: earlier messages were dropped to stay "
-                    "within the context window; ask the user if you need details)"
-                ),
-                *tail,
-            ]
+            self.history = [context.summary_message(SUMMARY_FALLBACK), *tail]
 
         self._trim_to_fit()
         after = self.used_tokens()
@@ -318,13 +312,7 @@ class Agent:
         ui.warn(f"! stopped after {self.cfg.max_steps} tool rounds (--max-steps)")
         self.log.event("max_steps_reached", steps=self.cfg.max_steps)
         self.history.append(
-            {
-                "role": "user",
-                "content": (
-                    f"[harness] Step limit ({self.cfg.max_steps}) reached. Stop calling "
-                    "tools and summarize what you did and what is left."
-                ),
-            }
+            {"role": "user", "content": step_limit_note(self.cfg.max_steps)}
         )
         return final_text
 
