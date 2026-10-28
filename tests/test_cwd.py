@@ -98,39 +98,92 @@ def test_marker_hidden(tmp: Path) -> None:
     check("early exit leaves cwd alone", cfg.cwd == before, str(cfg.cwd))
 
 
-def test_file_tools_follow(tmp: Path) -> None:
-    print("file tools follow the cwd")
+def test_file_tools_are_root_anchored(tmp: Path) -> None:
+    print("file tools ignore the shell cwd")
     cfg = make_cfg(tmp / "e")
     (cfg.workspace / "proj").mkdir()
     (cfg.workspace / "proj" / "f.txt").write_text("alpha\n", encoding="utf-8")
     (cfg.workspace / "f.txt").write_text("root file\n", encoding="utf-8")
-
-    check("reads from the root first",
-          "root file" in toolkit.tool_read_file({"path": "f.txt"}, cfg))
     sh(cfg, "cd proj")
-    check("now reads the child copy",
-          "alpha" in toolkit.tool_read_file({"path": "f.txt"}, cfg))
+    check("shell did move", cfg.cwd_label == "proj", cfg.cwd_label)
+
+    check("reads the root copy, not the child one",
+          "root file" in toolkit.tool_read_file({"path": "f.txt"}, cfg))
+    check("result shows the root-relative path",
+          toolkit.tool_read_file({"path": "f.txt"}, cfg).startswith("f.txt "))
+
+    # The path a result printed must round-trip to the same file. This is the
+    # regression: it used to resolve against the cwd and double the prefix.
+    shown = toolkit.tool_read_file({"path": "proj/f.txt"}, cfg).splitlines()[0]
+    check("printed path round-trips", shown.startswith("proj/f.txt"), shown)
+    toolkit.tool_write_file({"path": "proj/f2.txt", "content": "x\n"}, cfg)
+    check("no doubled prefix", (cfg.workspace / "proj" / "f2.txt").is_file())
+    check("nothing created at proj/proj",
+          not (cfg.workspace / "proj" / "proj").exists())
+
     toolkit.tool_write_file({"path": "new.txt", "content": "x\n"}, cfg)
-    check("writes into the child", (cfg.workspace / "proj" / "new.txt").is_file())
-    check("not into the root", not (cfg.workspace / "new.txt").exists())
+    check("bare name lands at the root", (cfg.workspace / "new.txt").is_file())
+    check("not in the shell's directory",
+          not (cfg.workspace / "proj" / "new.txt").exists())
+
     toolkit.tool_edit_file(
-        {"path": "f.txt", "old_string": "alpha", "new_string": "beta"}, cfg
+        {"path": "proj/f.txt", "old_string": "alpha", "new_string": "beta"}, cfg
     )
-    check("edits the child copy",
+    check("edit hits the intended file",
           (cfg.workspace / "proj" / "f.txt").read_text() == "beta\n")
     check("root copy untouched",
           (cfg.workspace / "f.txt").read_text() == "root file\n")
-    check("paths shown relative to the root",
-          "proj/f.txt" in toolkit.tool_read_file({"path": "f.txt"}, cfg))
-    # Escapes are still refused, now measured from the cwd.
+
+    # A missing file states what was resolved, without guessing intent.
+    try:
+        toolkit.tool_read_file({"path": "nope.txt"}, cfg)
+        check("missing file errors", False)
+    except ToolError as exc:
+        check("missing file errors", True)
+        check("error names the resolved path",
+              "nope.txt" in str(exc) and str(cfg.workspace) in str(exc), str(exc))
+
+    # New directories are reported, so a wrong path cannot be silent.
+    out = toolkit.tool_write_file({"path": "a/b/c.txt", "content": "y\n"}, cfg)
+    check("new directories reported", "new directory created: a, a/b" in out, out)
+    out = toolkit.tool_write_file({"path": "a/b/d.txt", "content": "y\n"}, cfg)
+    check("existing directories not reported", "new directory" not in out, out)
+
     for bad in ["../../etc/passwd", "/etc/passwd"]:
         try:
             toolkit.tool_read_file({"path": bad}, cfg)
             check(f"still refuses {bad}", False)
         except ToolError:
             check(f"still refuses {bad}", True)
-    check("parent inside the workspace is allowed",
-          "root file" in toolkit.tool_read_file({"path": "../f.txt"}, cfg))
+
+
+def test_state_block(tmp: Path) -> None:
+    print("state block")
+    from agent import Agent
+    from logbook import Logbook
+
+    cfg = make_cfg(tmp / "state")
+    (cfg.workspace / "sub").mkdir()
+    agent = Agent(cfg, Logbook(cfg.log_path))
+    agent.history = [{"role": "user", "content": "hi"}]
+
+    prompt_before = cfg.system_prompt()
+    messages = agent._messages()
+    check("state block is last", messages[-1]["content"].startswith("<state>"),
+          messages[-1]["content"][:20])
+    check("sent as user role", messages[-1]["role"] == "user")
+    check("names the workspace", str(cfg.workspace) in messages[-1]["content"])
+    check("says cwd is the root", "(.)" in messages[-1]["content"],
+          messages[-1]["content"])
+
+    sh(cfg, "cd sub")
+    after = agent._messages()
+    check("state block tracks the cwd", "(sub)" in after[-1]["content"],
+          after[-1]["content"])
+    check("system prompt is byte-identical", cfg.system_prompt() == prompt_before)
+    check("history keeps no copy of the state",
+          all("<state>" not in (m.get("content") or "") for m in agent.history))
+    check("history untouched", len(agent.history) == 1)
 
 
 def test_git_in_child(tmp: Path) -> None:
@@ -202,7 +255,8 @@ def main() -> int:
         test_cd_persists(tmp)
         test_escape_is_clamped(tmp)
         test_marker_hidden(tmp)
-        test_file_tools_follow(tmp)
+        test_file_tools_are_root_anchored(tmp)
+        test_state_block(tmp)
         test_git_in_child(tmp)
         test_interrupt_keeps_cwd(tmp)
         test_missing_cwd(tmp)

@@ -38,8 +38,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "directory, and combined stdout/stderr. Use it for listing, searching, "
                 "git, running tests, installing packages, and anything else system "
                 "level. The working directory persists between calls: `cd sub` in one "
-                "call applies to every later call, and the file tools follow it too. "
-                "It starts at the workspace root and cannot leave it."
+                "call applies to every later call. It starts at the workspace root "
+                "and cannot leave it. Note that read_file, write_file and edit_file "
+                "ignore it: their paths are always relative to the workspace root, "
+                "the same way every tool result prints them."
             ),
             "parameters": {
                 "type": "object",
@@ -71,9 +73,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "path": {
                         "type": "string",
                         "description": (
-                            "File path. Relative paths resolve against the "
-                            "shell's current directory and may not escape the "
-                            "workspace root."
+                            "File path, always relative to the workspace root and "
+                            "never to the shell's current directory. It may not "
+                            "escape the workspace root."
                         ),
                     },
                     "offset": {
@@ -104,9 +106,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "path": {
                         "type": "string",
                         "description": (
-                            "File path. Relative paths resolve against the "
-                            "shell's current directory and may not escape the "
-                            "workspace root."
+                            "File path, always relative to the workspace root and "
+                            "never to the shell's current directory. It may not "
+                            "escape the workspace root."
                         ),
                     },
                     "content": {
@@ -133,9 +135,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "path": {
                         "type": "string",
                         "description": (
-                            "File path. Relative paths resolve against the "
-                            "shell's current directory and may not escape the "
-                            "workspace root."
+                            "File path, always relative to the workspace root and "
+                            "never to the shell's current directory. It may not "
+                            "escape the workspace root."
                         ),
                     },
                     "old_string": {
@@ -165,9 +167,12 @@ def _require_str(args: dict, key: str) -> str:
     return value
 
 
-def _read_text(path: Path) -> str:
+def _read_text(path: Path, cfg: Config | None = None) -> str:
     if not path.exists():
-        raise ToolError(f"no such file: {path}")
+        # State the resolved path. The rule that produced it is in the per-request
+        # state block, so the model never has to infer it from an error message.
+        where = f"{display_path(cfg.workspace, path)} (resolved to {path})" if cfg else path
+        raise ToolError(f"no such file: {where}")
     if path.is_dir():
         raise ToolError(f"{path} is a directory, not a file")
     size = path.stat().st_size
@@ -251,8 +256,8 @@ def _take_cwd(output: str, cfg: Config) -> tuple[str, list[str]]:
 
 
 def tool_read_file(args: dict, cfg: Config) -> str:
-    path = resolve_in_workspace(cfg.workspace, _require_str(args, "path"), cfg.cwd)
-    text = _read_text(path)
+    path = resolve_in_workspace(cfg.workspace, _require_str(args, "path"))
+    text = _read_text(path, cfg)
     lines = text.splitlines()
 
     offset = args.get("offset") or 1
@@ -280,22 +285,27 @@ def tool_read_file(args: dict, cfg: Config) -> str:
 
 
 def tool_write_file(args: dict, cfg: Config) -> str:
-    path = resolve_in_workspace(cfg.workspace, _require_str(args, "path"), cfg.cwd)
+    path = resolve_in_workspace(cfg.workspace, _require_str(args, "path"))
     content = _require_str(args, "content")
     if path.is_dir():
         raise ToolError(f"{path} is a directory")
     existed = path.exists()
+    made = [p for p in path.parents if not p.exists() and cfg.workspace in p.parents]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     verb = "Overwrote" if existed else "Created"
+    note = ""
+    if made:
+        fresh = ", ".join(sorted(display_path(cfg.workspace, p) for p in made))
+        note = f"; new directory created: {fresh}"
     return (
         f"{verb} {display_path(cfg.workspace, path)} "
-        f"({len(content)} chars, {len(content.splitlines())} lines)"
+        f"({len(content)} chars, {len(content.splitlines())} lines){note}"
     )
 
 
 def tool_edit_file(args: dict, cfg: Config) -> str:
-    path = resolve_in_workspace(cfg.workspace, _require_str(args, "path"), cfg.cwd)
+    path = resolve_in_workspace(cfg.workspace, _require_str(args, "path"))
     old = _require_str(args, "old_string")
     new = _require_str(args, "new_string")
     replace_all = bool(args.get("replace_all", False))
@@ -305,7 +315,7 @@ def tool_edit_file(args: dict, cfg: Config) -> str:
     if old == new:
         raise ToolError("old_string and new_string are identical; nothing to do")
 
-    text = _read_text(path)
+    text = _read_text(path, cfg)
     count = text.count(old)
     if count == 0:
         raise ToolError(

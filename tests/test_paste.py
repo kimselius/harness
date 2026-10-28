@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 import mock_server  # noqa: E402
 
 import main  # noqa: E402
+import ptyrun  # noqa: E402
 
 failures: list[str] = []
 
@@ -32,6 +33,14 @@ def check(label: str, condition: bool, detail: str = "") -> None:
     else:
         failures.append(label)
         print(f"  FAIL {label} {detail}")
+
+
+def real_users(messages: list[dict]) -> list[str]:
+    """User messages, minus the harness state block appended to every request."""
+    return [
+        m["content"] for m in messages
+        if m["role"] == "user" and not m["content"].startswith("<state>")
+    ]
 
 
 def test_drain() -> None:
@@ -78,53 +87,10 @@ def test_assemble() -> None:
 
 
 def repl_session(base_url: str, keystrokes: list[bytes], tmp: Path) -> str:
-    """Run main.py on a pty, send keystrokes, return everything it printed."""
-    master, slave = pty.openpty()
-    proc = subprocess.Popen(
-        [
-            sys.executable, "-u", str(ROOT / "main.py"),
-            "--model", "mock",
-            "--base-url", base_url,
-            "--workspace", str(tmp / "ws"),
-            "--log-dir", str(tmp / "logs"),
-            "--prompt-file", str(tmp / "nope.md"),
-            "--no-stream",
-            "--no-markdown",
-        ],
-        stdin=slave,
-        stdout=slave,
-        stderr=slave,
-        env={**os.environ, "OPENAI_API_KEY": "x", "TERM": "dumb"},
-        close_fds=True,
-    )
-    os.close(slave)
-    output: list[str] = []
-
-    def pump(seconds: float) -> None:
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select([master], [], [], 0.05)
-            if not ready:
-                continue
-            try:
-                data = os.read(master, 65536)
-            except OSError:
-                break
-            if not data:
-                break
-            output.append(data.decode("utf-8", errors="replace"))
-
-    pump(2.0)  # let the banner print and the prompt appear
-    for chunk in keystrokes:
-        os.write(master, chunk)
-        pump(2.5)
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
-    os.close(master)
-    return "".join(output)
+    # Wait between keystroke groups, so each one is a separate paste or line
+    # rather than one burst arriving together.
+    script = [(0.0 if i == 0 else 2.5, chunk) for i, chunk in enumerate(keystrokes)]
+    return ptyrun.repl(base_url, tmp, script, settle=2.5)
 
 
 def test_repl_paste(tmp: Path, base_url: str) -> None:
@@ -137,11 +103,11 @@ def test_repl_paste(tmp: Path, base_url: str) -> None:
     check("the model was called once", len(requests) == 1, str(len(requests)))
     if not requests:
         return
-    users = [m for m in requests[0]["messages"] if m["role"] == "user"]
-    check("exactly one user message", len(users) == 1, str(len(users)))
+    users = real_users(requests[0]["messages"])
+    check("exactly one user message", len(users) == 1, str(users))
     check("all three lines in it",
-          users and users[0]["content"] == "first line\nsecond line\nthird line",
-          repr(users[0]["content"]) if users else "")
+          users and users[0] == "first line\nsecond line\nthird line",
+          repr(users[0]) if users else "")
     check("paste was announced", "3 lines pasted" in screen, screen[-300:])
     check("session exited cleanly", "bye" in screen)
 
@@ -155,7 +121,7 @@ def test_repl_single_line_unchanged(tmp: Path, base_url: str) -> None:
     requests = [r for r in mock_server.REQUESTS if r.get("messages")]
     check("two separate turns", len(requests) == 2, str(len(requests)))
     if len(requests) == 2:
-        users = [m["content"] for m in requests[1]["messages"] if m["role"] == "user"]
+        users = real_users(requests[1]["messages"])
         check("both messages kept separate", users == ["hello", "again"], str(users))
     check("no paste notice", "lines pasted" not in screen)
 

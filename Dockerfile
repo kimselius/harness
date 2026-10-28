@@ -6,8 +6,9 @@
 #     -v "$PWD/workspace":/ws -v "$PWD/logs":/logs \
 #     -e HARNESS_WORKSPACE=/ws -e HARNESS_LOG_DIR=/logs harness
 #
-# The agent runs as root with no sandbox beyond path confinement. That is the
-# point: throw the container away, not a VM.
+# Runs as uid 1001, not root. On Linux the mounted workspace and log directories
+# must be writable by that uid: either `chown -R 1001:1001 workspace logs` on the
+# host, or override with `--user "$(id -u):$(id -g)"`.
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -15,7 +16,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
-    TERM=xterm-256color
+    TERM=xterm-256color \
+    HOME=/home/harness
 
 # python3 runs the harness; the rest is what an agent reaches for constantly.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -30,9 +32,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         procps \
     && rm -rf /var/lib/apt/lists/*
 
+# Dedicated unprivileged account. 1001 is free on Ubuntu 24.04, whose own
+# "ubuntu" user already holds 1000.
+RUN groupadd --gid 1001 harness \
+    && useradd --uid 1001 --gid 1001 --create-home --shell /bin/bash harness
+
 WORKDIR /harness
 
-# Dependencies first, so source edits don't invalidate the pip layer.
+# Dependencies first (as root, into system site-packages), so source edits do not
+# invalidate the pip layer.
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
 
@@ -41,8 +49,12 @@ COPY tests/ ./tests/
 # Matches PROMPT.md.example always, and your own PROMPT.md when it exists.
 COPY PROMPT.md* ./
 
-RUN mkdir -p workspace logs
+# Only these two need to be writable. The source stays owned by root, so the agent
+# cannot modify the harness that is running it, even inside the container.
+RUN mkdir -p workspace logs && chown -R 1001:1001 workspace logs
 
-# Args land on main.py: bare `docker run -it harness` opens the REPL, and
-# `docker run --rm harness -p "do a thing"` runs one shot.
+USER 1001:1001
+
+# Args land on main.py: bare `docker run -it <image>` opens the REPL, and
+# `docker run --rm <image> -p "do a thing"` runs one shot.
 ENTRYPOINT ["python3", "main.py"]

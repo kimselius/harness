@@ -40,12 +40,21 @@ RUNTIME_FACTS = """\
 <environment>
 Tools: shell, read_file, write_file, edit_file.
 Workspace root: {workspace}
-Your shell keeps its working directory between calls, like a real session: `cd sub`
-in one call applies to the next, and read_file/write_file/edit_file resolve relative
-paths against it too. Every shell result tells you where you are. It starts at the
-workspace root and cannot leave it. So to inspect a subproject, `cd` into it once
-and then work normally — `git diff`, `git log`, tests — instead of prefixing every
-command with the path.
+Nothing outside that root is reachable, and every path a tool prints is relative to
+it.
+
+Two separate rules, which never change:
+- read_file, write_file and edit_file resolve their `path` from the workspace root.
+  A path means the same file no matter what the shell has been doing, so a path you
+  read in an earlier tool result is always safe to pass back.
+- shell keeps a working directory between calls, like a real session: `cd sub` in
+  one call applies to later calls. It affects shell commands only, never the file
+  tools. So to work on a subproject, `cd` into it once and then use `git diff`,
+  `git log` or tests without prefixes.
+
+The last message of every request is a <state> block written by the harness, not by
+the user. It carries the exact workspace root and the shell's current directory.
+Read it rather than assuming, and do not reply to it.
 
 You act on files yourself. Use read_file to inspect, write_file to create or
 replace, edit_file to change part of a file. Never print a file's contents, a patch
@@ -140,6 +149,21 @@ class Config:
             columns=shutil.get_terminal_size(fallback=(80, 24)).columns,
         )
         return f"{body}\n\n{facts}"
+
+    def state_block(self) -> str:
+        """Authoritative session state, sent with every request.
+
+        It goes at the end of the message list rather than into the system prompt:
+        the prompt stays byte-identical all session, so the server's cached prefix
+        survives, and the model still gets current values every turn.
+        """
+        return (
+            "<state>\n"
+            f"workspace root: {self.workspace}\n"
+            f"file tool paths resolve from: {self.workspace} (always)\n"
+            f"shell working directory: {self.cwd} ({self.cwd_label})\n"
+            "</state>"
+        )
 
     @property
     def prompt_source(self) -> str:

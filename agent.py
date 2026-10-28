@@ -68,6 +68,8 @@ class Agent:
         self.meter = context.TokenMeter(toolkit.TOOL_SCHEMAS)
         self.compactions = 0
         self.interrupted = False
+        # Optional InputQueue: messages typed while the turn is running.
+        self.inbox: Any = None
 
     def attach_log(self, log: Logbook) -> None:
         """Point the agent and its client at another session's log."""
@@ -108,7 +110,15 @@ class Agent:
 
     def _messages(self) -> list[dict[str, Any]]:
         # System prompt is rebuilt per request, so PROMPT.md edits apply live.
-        return [{"role": "system", "content": self.cfg.system_prompt()}, *self.history]
+        # The state block is appended, never stored: the model always sees current
+        # values, history keeps no stale copies, and the prompt prefix stays cached.
+        return [
+            {"role": "system", "content": self.cfg.system_prompt()},
+            *self.history,
+            # Role "user", not "system": Gemma-style templates have no system role,
+            # so a trailing system message can be dropped by the server's template.
+            {"role": "user", "content": self.cfg.state_block()},
+        ]
 
     def _printer(self) -> _Printer:
         style = ui.colors_enabled()
@@ -240,6 +250,18 @@ class Agent:
         )
         self.log.event("pasted_code_block", lines=lines)
 
+    # -- steering ----------------------------------------------------------
+    def take_queued_input(self) -> int:
+        """Add anything typed during the turn to the history. Returns how many."""
+        if not self.inbox:
+            return 0
+        messages = self.inbox.drain()
+        for message in messages:
+            self.history.append({"role": "user", "content": message})
+            self.log.event("user_message", content=message, queued=True)
+            ui.info(f"+ your message was added to the context: {message[:60]}")
+        return len(messages)
+
     # -- interruption ------------------------------------------------------
     def note_interrupt(self, where: str) -> None:
         """Record an interruption so the next turn starts from a clean state."""
@@ -258,6 +280,10 @@ class Agent:
         final_text = ""
 
         for step in range(1, self.cfg.max_steps + 1):
+            # Pick up steering typed while the previous step was running, before
+            # the next request goes out. History is well formed at this point:
+            # every tool call of the last round already has its result.
+            self.take_queued_input()
             self.maybe_compact()
             printer = self._printer()
 

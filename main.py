@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 import sessions
+import steer
 import tools as toolkit
 import ui
 from agent import Agent
@@ -42,6 +43,7 @@ commands
   /limits            current output/timeout limits
   /exit, /quit       leave (Ctrl-D also works)
 input
+  type while busy    messages are queued and picked up at the next step
   paste              multi-line pastes are kept together as one message
   <<<                type a multi-line message, end with a line containing >>>
   Ctrl-C             interrupt the running turn (kills any running command)
@@ -232,6 +234,9 @@ def handle_command(line: str, agent: Agent) -> bool:
 
 
 def run_turn(agent: Agent, message: str) -> None:
+    # Watch stdin for the duration of the turn so typing is queued, not lost.
+    if agent.inbox:
+        agent.inbox.start()
     try:
         agent.run(message)
     except KeyboardInterrupt:
@@ -241,6 +246,9 @@ def run_turn(agent: Agent, message: str) -> None:
     except Exception as exc:
         ui.error(f"! {type(exc).__name__}: {exc}")
         agent.repair_history(reason=f"harness error: {exc}")
+    finally:
+        if agent.inbox:
+            agent.inbox.stop()
     cfg = agent.cfg
     parts = []
     if agent.last_usage:
@@ -319,6 +327,8 @@ def main() -> int:
         return 130 if agent.interrupted else 0  # 130 = terminated by SIGINT
 
     setup_readline(history_file(cfg))
+    agent.inbox = steer.InputQueue()
+    agent.inbox.on_queued = lambda text: ui.info("» queued, will be sent next step")
     print(
         ui.bold("harness")
         + ui.dim(" — /help for commands, Ctrl-C to interrupt, Ctrl-D to exit")
@@ -332,9 +342,14 @@ def main() -> int:
     )
     ui.info(f"log {cfg.log_path}")
 
+    prefix = ""  # text typed without Enter while the agent was working
     while True:
         try:
-            line = read_message(ui.cyan("> "))
+            # Show the shell's directory when it is not the workspace root, so
+            # the state the model sees is visible to you as well.
+            where = "" if cfg.cwd == cfg.workspace else ui.dim(f"{cfg.cwd_label} ")
+            line = prefix + read_message(where + ui.cyan("> "))
+            prefix = ""
         except EOFError:
             print()
             break
@@ -356,6 +371,13 @@ def main() -> int:
             if not line.strip():
                 continue
         run_turn(agent, line)
+        # Anything typed during the final step of the turn runs as the next turn.
+        while agent.inbox and agent.inbox.pending():
+            queued = "\n".join(agent.inbox.drain())
+            ui.info("» sending the message you typed while it was working")
+            run_turn(agent, queued)
+        if agent.inbox:
+            prefix = agent.inbox.take_leftover()
 
     log.event("session_end", mode="interactive", messages=len(agent.history))
     ui.info("bye")
