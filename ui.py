@@ -4,9 +4,31 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
+from typing import Any
 
-_ENABLED = sys.stdout.isatty() and not os.getenv("NO_COLOR")
+def _enable_windows_vt() -> bool:
+    """Turn on ANSI handling in the Windows console. True if colour is usable."""
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
+    except Exception:
+        return False
+
+
+# Old consoles that cannot do VT get no colour, which also means no escape codes
+# in the prompt and so nothing for a line editor to miscount.
+_ENABLED = sys.stdout.isatty() and not os.getenv("NO_COLOR") and _enable_windows_vt()
 
 
 def colors_enabled() -> bool:
@@ -39,6 +61,49 @@ def yellow(t: str) -> str:
 
 def red(t: str) -> str:
     return _c("31", t)
+
+
+_ANSI = re.compile(r"(\033\[[0-9;]*m)")
+_READLINE_SAFE = False  # set by enable_readline_prompts()
+
+
+def supports_prompt_markers(module: Any) -> bool:
+    """Whether this line editor understands \\001/\\002 around escape codes.
+
+    GNU readline defines them (RL_PROMPT_START_IGNORE) and libedit honours them
+    too, and both ship as CPython's own `readline` extension. Third-party
+    stand-ins such as pyreadline3 on Windows do not, and would print the markers
+    as literal control characters — so only opt in when the module is recognised.
+    """
+    if module is None:
+        return False
+    backend = getattr(module, "backend", None)
+    if backend in ("readline", "editline"):
+        return True
+    if backend is not None:
+        return False  # a backend we have not verified
+    # Older CPython has no `backend`, but its extension module exposes this.
+    return hasattr(module, "_READLINE_LIBRARY_VERSION")
+
+
+def enable_readline_prompts(module: Any = None) -> bool:
+    """Opt in to zero-width prompt markers if the editor supports them."""
+    global _READLINE_SAFE
+    _READLINE_SAFE = supports_prompt_markers(module)
+    return _READLINE_SAFE
+
+
+def input_prompt(text: str) -> str:
+    """Mark colour codes as zero-width for readline.
+
+    Both GNU readline and libedit count every byte of the prompt when working out
+    where the line wraps, so raw escape codes make them wrap too early: a long
+    line then redraws over itself and editing corrupts the display. \\001/\\002
+    tell them the enclosed bytes occupy no columns.
+    """
+    if not _READLINE_SAFE:
+        return text
+    return _ANSI.sub("\001\\1\002", text)
 
 
 def _one_line(text: str, width: int = 100) -> str:

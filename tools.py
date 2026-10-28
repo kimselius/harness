@@ -23,10 +23,14 @@ MAX_READ_BYTES = 20 * 1024 * 1024
 CWD_MARKER = "__harness_cwd_6b1f__:"
 # The leading newline matters: without it the marker is glued to the last line of
 # output whenever a command does not end with one (`printf` without \n).
+# POSIX shell syntax, so it is only appended where /bin/sh runs the command.
+# On Windows the command would be handed to cmd.exe, which would choke on it, so
+# the probe is skipped there and the directory simply stays at the workspace root.
+POSIX_SHELL = os.name != "nt"
 CWD_PROBE = (
     f'\n__harness_rc=$?\nprintf "\\n%s%s\\n" "{CWD_MARKER}" "$(pwd)"\n'
     "exit $__harness_rc\n"
-)
+) if POSIX_SHELL else ""
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -185,11 +189,24 @@ def _read_text(path: Path, cfg: Config | None = None) -> str:
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
-    """Kill the command and everything it spawned."""
+    """Kill the command and everything it spawned.
+
+    Process groups are POSIX-only: os.killpg and SIGKILL do not exist on Windows,
+    where killing the direct child is the best we can do.
+    """
+    killpg = getattr(os, "killpg", None)
+    getpgid = getattr(os, "getpgid", None)
+    sigkill = getattr(signal, "SIGKILL", None)
+    if killpg and getpgid and sigkill is not None:
+        try:
+            killpg(getpgid(proc.pid), sigkill)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
         proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
 
 
 def tool_shell(args: dict, cfg: Config) -> str:
@@ -208,7 +225,9 @@ def tool_shell(args: dict, cfg: Config) -> str:
         stderr=subprocess.STDOUT,
         text=True,
         errors="replace",
-        start_new_session=True,  # own process group, so timeouts kill children too
+        # Own process group, so timeouts and Ctrl-C kill children too. Silently
+        # ignored on Windows, where only the direct child can be killed.
+        start_new_session=POSIX_SHELL,
     )
     timed_out = False
     try:

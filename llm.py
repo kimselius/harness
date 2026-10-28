@@ -4,10 +4,46 @@ from __future__ import annotations
 
 from typing import Any
 
-from openai import OpenAI
+import ui
+from openai import BadRequestError, OpenAI
 
 from config import Config
 from logbook import Logbook
+
+# Sentinel for "use the configured effort"; None means "send no effort at all".
+INHERIT = "__inherit__"
+
+# Servers disagree on the field name for chain-of-thought text. These are the ones
+# in the wild: reasoning_content (Ollama, vLLM, DeepSeek), reasoning (OpenRouter),
+# thinking (some proxies).
+REASONING_FIELDS = ("reasoning_content", "reasoning", "thinking")
+
+
+def _extra(obj: Any, names: tuple[str, ...]) -> str:
+    """First non-empty value among `names`, whether a real field or an extra one."""
+    if obj is None:
+        return ""
+    for name in names:
+        value = getattr(obj, name, None)
+        if isinstance(value, str) and value:
+            return value
+    extra = getattr(obj, "model_extra", None) or {}
+    for name in names:
+        value = extra.get(name)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def reasoning_tokens(usage: dict[str, Any] | None) -> int | None:
+    """Reasoning tokens from either the OpenAI shape or the flat one."""
+    if not usage:
+        return None
+    details = usage.get("completion_tokens_details") or {}
+    for value in (details.get("reasoning_tokens"), usage.get("reasoning_tokens")):
+        if isinstance(value, int):
+            return value
+    return None
 
 
 class Reply:
@@ -20,12 +56,21 @@ class Reply:
         usage: dict[str, Any] | None,
         finish_reason: str | None,
         interrupted: bool = False,
+        reasoning: str = "",
     ) -> None:
         self.content = content
         self.tool_calls = tool_calls
         self.usage = usage
         self.finish_reason = finish_reason
         self.interrupted = interrupted
+        # Captured for the log and the terminal, never sent back: OpenAI-compatible
+        # APIs do not accept reasoning in an assistant message, and replaying it
+        # would waste context.
+        self.reasoning = reasoning
+
+    @property
+    def reasoning_tokens(self) -> int | None:
+        return reasoning_tokens(self.usage)
 
     def as_message(self) -> dict[str, Any]:
         """Assistant message to append to history (provider-safe subset)."""
@@ -56,12 +101,15 @@ class LLM:
             max_retries=3,
         )
         self._supports_stream_usage = True
+        self._supports_effort = True
+        self._supports_extra_body = True
 
     def _params(
         self,
         messages: list[dict],
         tools: list[dict] | None,
         model: str | None = None,
+        effort: str | None = INHERIT,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "model": model or self.cfg.model,
@@ -73,6 +121,31 @@ class LLM:
             params["temperature"] = self.cfg.temperature
         if self.cfg.max_tokens is not None:
             params["max_tokens"] = self.cfg.max_tokens
+
+        chosen = self.cfg.reasoning_effort if effort == INHERIT else effort
+        if chosen and self._supports_effort:
+            params["reasoning_effort"] = chosen
+        if self.cfg.extra_body and self._supports_extra_body:
+            # Must go through the SDK's extra_body: create() is typed and rejects
+            # unknown keyword arguments outright.
+            params["extra_body"] = dict(self.cfg.extra_body)
+        return params
+
+    def _without_unsupported(self, params: dict[str, Any]) -> dict[str, Any] | None:
+        """Drop provider-specific fields after a rejection. None if none were sent."""
+        dropped = []
+        params = dict(params)
+        if "reasoning_effort" in params:
+            params.pop("reasoning_effort")
+            self._supports_effort = False
+            dropped.append("reasoning_effort")
+        if params.pop("extra_body", None):
+            self._supports_extra_body = False
+            dropped.extend(sorted(self.cfg.extra_body or {}))
+        if not dropped:
+            return None
+        self.log.event("params_dropped", fields=dropped, reason="server rejected them")
+        ui.warn(f"! this endpoint rejected {', '.join(dropped)}; continuing without")
         return params
 
     def complete(
@@ -82,22 +155,34 @@ class LLM:
         on_text: Any = None,
         model: str | None = None,
         purpose: str = "turn",
+        effort: str | None = INHERIT,
+        on_reasoning: Any = None,
     ) -> Reply:
-        """One model call. on_text(chunk) is called with streamed text deltas."""
-        params = self._params(messages, tools, model=model)
+        """One model call.
+
+        on_text(chunk) and on_reasoning(chunk) receive streamed deltas. Pass
+        effort=None to send no reasoning_effort for this call.
+        """
+        params = self._params(messages, tools, model=model, effort=effort)
         self.log.event(
             "llm_request",
             model=params["model"],
             purpose=purpose,
             stream=self.cfg.stream,
+            reasoning_effort=params.get("reasoning_effort"),
             messages=messages,
             tool_names=[t["function"]["name"] for t in tools or []],
         )
         try:
-            if self.cfg.stream:
-                reply = self._stream(params, on_text)
-            else:
-                reply = self._once(params)
+            reply = self._dispatch(params, on_text, on_reasoning)
+        except BadRequestError:
+            # Some OpenAI-compatible servers reject reasoning_effort outright.
+            # Drop the provider-specific fields once and retry, rather than
+            # failing the turn.
+            retry = self._without_unsupported(params)
+            if retry is None:
+                raise
+            reply = self._dispatch(retry, on_text, on_reasoning)
         except Exception as exc:
             self.log.event("llm_error", error=f"{type(exc).__name__}: {exc}")
             raise
@@ -111,8 +196,16 @@ class LLM:
             finish_reason=reply.finish_reason,
             usage=reply.usage,
             interrupted=reply.interrupted,
+            reasoning=reply.reasoning,
+            reasoning_chars=len(reply.reasoning),
+            reasoning_tokens=reply.reasoning_tokens,
         )
         return reply
+
+    def _dispatch(self, params: dict, on_text: Any, on_reasoning: Any) -> Reply:
+        if self.cfg.stream:
+            return self._stream(params, on_text, on_reasoning)
+        return self._once(params)
 
     def _once(self, params: dict) -> Reply:
         response = self.client.chat.completions.create(**params)
@@ -128,9 +221,15 @@ class LLM:
             for i, tc in enumerate(choice.message.tool_calls or [])
         ]
         usage = response.usage.model_dump() if response.usage else None
-        return Reply(choice.message.content or "", calls, usage, choice.finish_reason)
+        return Reply(
+            choice.message.content or "",
+            calls,
+            usage,
+            choice.finish_reason,
+            reasoning=_extra(choice.message, REASONING_FIELDS),
+        )
 
-    def _stream(self, params: dict, on_text: Any) -> Reply:
+    def _stream(self, params: dict, on_text: Any, on_reasoning: Any = None) -> Reply:
         kwargs = dict(params, stream=True)
         if self._supports_stream_usage:
             kwargs["stream_options"] = {"include_usage": True}
@@ -145,6 +244,7 @@ class LLM:
             stream = self.client.chat.completions.create(**kwargs)
 
         text_parts: list[str] = []
+        thought_parts: list[str] = []
         slots: dict[int, dict[str, str]] = {}
         usage: dict[str, Any] | None = None
         finish_reason: str | None = None
@@ -162,6 +262,11 @@ class LLM:
                 delta = choice.delta
                 if delta is None:
                     continue
+                thought = _extra(delta, REASONING_FIELDS)
+                if thought:
+                    thought_parts.append(thought)
+                    if on_reasoning:
+                        on_reasoning(thought)
                 if delta.content:
                     text_parts.append(delta.content)
                     if on_text:
@@ -189,7 +294,10 @@ class LLM:
                 pass
 
         if interrupted:
-            return Reply("".join(text_parts), [], usage, "interrupted", True)
+            return Reply(
+                "".join(text_parts), [], usage, "interrupted", True,
+                reasoning="".join(thought_parts),
+            )
 
         calls = [
             {
@@ -199,4 +307,7 @@ class LLM:
             }
             for index, slot in sorted(slots.items())
         ]
-        return Reply("".join(text_parts), calls, usage, finish_reason)
+        return Reply(
+            "".join(text_parts), calls, usage, finish_reason,
+            reasoning="".join(thought_parts),
+        )

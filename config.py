@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -13,6 +14,11 @@ import sessions
 
 # Env vars that must not leak into shell commands the model runs.
 SECRET_ENV_PREFIXES = ("OPENAI_", "HARNESS_", "ANTHROPIC_")
+
+# Reasoning is on by default. Anything in OFF_VALUES means "send nothing", which
+# leaves the model at its own default.
+DEFAULT_REASONING_EFFORT = "medium"
+OFF_VALUES = {"", "off", "none", "no", "false", "0", "default"}
 
 # Everything the harness creates (workspace, logs, REPL history, .env) lives here,
 # so a checkout stays self-contained no matter which directory you launch from.
@@ -98,6 +104,9 @@ class Config:
     compact: bool
     summary_model: str | None
     markdown: bool
+    reasoning_effort: str | None
+    show_thinking: bool
+    extra_body: dict
 
     # Mutable session state, not a flag: the shell's working directory, which
     # persists between tool calls like a real shell session.
@@ -176,6 +185,12 @@ class Config:
             for k, v in os.environ.items()
             if not k.startswith(SECRET_ENV_PREFIXES)
         }
+
+
+def normalize_effort(value: str | None) -> str | None:
+    """None means "send no reasoning_effort at all"."""
+    text = (value or "").strip()
+    return None if text.lower() in OFF_VALUES else text
 
 
 def anchor(raw: str) -> Path:
@@ -332,6 +347,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable response streaming.",
     )
     p.add_argument(
+        "--reasoning-effort",
+        default=os.getenv("HARNESS_REASONING_EFFORT", DEFAULT_REASONING_EFFORT),
+        metavar="LEVEL",
+        help=(
+            f"reasoning_effort sent with every request (default: "
+            f"{DEFAULT_REASONING_EFFORT}). Use minimal, low, medium, high, or 'off' "
+            "to send nothing and leave the model at its own default. Dropped "
+            "automatically if the endpoint rejects it."
+        ),
+    )
+    p.add_argument(
+        "--show-thinking",
+        action="store_true",
+        help=(
+            "Print reasoning text as it streams. It is always written to the session "
+            "log either way."
+        ),
+    )
+    p.add_argument(
+        "--extra-body",
+        default=os.getenv("HARNESS_EXTRA_BODY") or None,
+        metavar="JSON",
+        help=(
+            "Extra JSON fields merged into every request body, for endpoint-specific "
+            'knobs, e.g. \'{"top_k": 40}\'. Dropped automatically if rejected.'
+        ),
+    )
+    p.add_argument(
         "--no-markdown",
         action="store_true",
         help=(
@@ -373,6 +416,15 @@ def config_from_args(args: argparse.Namespace) -> Config:
                 "--base-url for a local server."
             )
 
+    extra_body: dict = {}
+    if args.extra_body:
+        try:
+            extra_body = json.loads(args.extra_body)
+        except json.JSONDecodeError as exc:
+            sys.exit(f"--extra-body is not valid JSON: {exc}")
+        if not isinstance(extra_body, dict):
+            sys.exit("--extra-body must be a JSON object")
+
     log_dir = anchor(args.log_dir)
     resumed = False
     if args.resume is not None:
@@ -407,4 +459,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         compact=not args.no_compact,
         summary_model=args.summary_model,
         markdown=not args.no_markdown,
+        reasoning_effort=normalize_effort(args.reasoning_effort),
+        show_thinking=args.show_thinking,
+        extra_body=extra_body,
     )

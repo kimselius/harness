@@ -86,6 +86,51 @@ def test_assemble() -> None:
     check("indentation preserved", out == "# snippet\ndef f():\n    return 1", repr(out))
 
 
+def test_input_prompt_markers() -> None:
+    print("readline prompt width")
+    import ui
+
+    coloured = "\033[2mapp \033[0m\033[36m> \033[0m"
+
+    class Fake:
+        def __init__(self, **kw):
+            for key, value in kw.items():
+                setattr(self, key, value)
+
+    # Which line editors understand the zero-width markers.
+    check("GNU readline (linux)", ui.supports_prompt_markers(Fake(backend="readline")))
+    check("libedit (macos)", ui.supports_prompt_markers(Fake(backend="editline")))
+    check("older cpython without .backend",
+          ui.supports_prompt_markers(Fake(_READLINE_LIBRARY_VERSION="8.2")))
+    check("pyreadline3 on windows is excluded",
+          not ui.supports_prompt_markers(Fake(__version__="3.4.1")))
+    check("unverified backend is excluded",
+          not ui.supports_prompt_markers(Fake(backend="something-new")))
+    check("no readline at all", not ui.supports_prompt_markers(None))
+
+    ui.enable_readline_prompts(None)
+    check("left alone with no supported editor", ui.input_prompt(coloured) == coloured)
+
+    check("opt-in reports success", ui.enable_readline_prompts(Fake(backend="readline")))
+    wrapped = ui.input_prompt(coloured)
+    check("every escape is bracketed",
+          wrapped.count("\001") == 4 and wrapped.count("\002") == 4, repr(wrapped))
+    check("visible text unchanged",
+          wrapped.replace("\001", "").replace("\002", "") == coloured, repr(wrapped))
+    check("markers wrap only escapes",
+          all(chunk.split("\002")[0].startswith("\033[")
+              for chunk in wrapped.split("\001")[1:]), repr(wrapped))
+    check("plain text is a no-op", ui.input_prompt("> ") == "> ")
+
+    # This machine's actual editor, whatever it is, must be classified.
+    import readline
+
+    decided = ui.supports_prompt_markers(readline)
+    check("local editor classified", isinstance(decided, bool))
+    print(f"       (local backend: {getattr(readline, 'backend', 'unknown')} "
+          f"-> markers {'on' if decided else 'off'})")
+
+
 def repl_session(base_url: str, keystrokes: list[bytes], tmp: Path) -> str:
     # Wait between keystroke groups, so each one is a separate paste or line
     # rather than one burst arriving together.
@@ -143,6 +188,7 @@ def main_() -> int:
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
         test_drain()
+        test_input_prompt_markers()
         test_assemble()
         test_repl_paste(tmp, base_url)
         test_repl_single_line_unchanged(tmp, base_url)

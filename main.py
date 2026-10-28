@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import atexit
 import os
-import select
 import sys
 from pathlib import Path
 
@@ -14,7 +13,14 @@ import steer
 import tools as toolkit
 import ui
 from agent import Agent
-from config import BASE_DIR, Config, build_parser, config_from_args, load_dotenv
+from config import (
+    BASE_DIR,
+    Config,
+    build_parser,
+    config_from_args,
+    load_dotenv,
+    normalize_effort,
+)
 from logbook import Logbook
 
 
@@ -40,7 +46,8 @@ commands
   /log               path to the JSONL session log
   /sessions          list recorded sessions
   /resume <id>       load an earlier session (id, prefix, or "last")
-  /limits            current output/timeout limits
+  /limits            current output/timeout limits and reasoning settings
+  /think [level]     show or set reasoning_effort (high, low, off, ...)
   /exit, /quit       leave (Ctrl-D also works)
 input
   type while busy    messages are queued and picked up at the next step
@@ -55,6 +62,8 @@ def setup_readline(path: Path) -> None:
         import readline
     except ImportError:
         return
+    # Zero-width prompt markers, but only if this editor understands them.
+    ui.enable_readline_prompts(readline)
     try:
         readline.read_history_file(path)
     except OSError:
@@ -79,24 +88,7 @@ BRACKET_END = "\x1b[201~"
 
 def drain_buffered(fd: int, settle: float = PASTE_SETTLE) -> str:
     """Read input that is already waiting on fd. Empty string if there is none."""
-    chunks: list[str] = []
-    timeout = 0.0  # typed lines must not pay any latency for this
-    while True:
-        try:
-            ready, _, _ = select.select([fd], [], [], timeout)
-        except (OSError, ValueError):
-            break
-        if not ready:
-            break
-        try:
-            data = os.read(fd, 65536)
-        except OSError:
-            break
-        if not data:
-            break
-        chunks.append(data.decode("utf-8", errors="replace"))
-        timeout = settle  # a paste can arrive in several chunks
-    return "".join(chunks)
+    return steer.read_pending(fd, settle)
 
 
 def assemble_paste(first: str, rest: str, read_more=input) -> str:
@@ -228,6 +220,20 @@ def handle_command(line: str, agent: Agent) -> bool:
             f"shell timeout: {cfg.shell_timeout:g}s (max {cfg.max_shell_timeout:g}s) · "
             f"max steps: {cfg.max_steps}"
         )
+        ui.info(
+            f"reasoning_effort: {cfg.reasoning_effort or '(model default)'} · "
+            f"show thinking: {'yes' if cfg.show_thinking else 'no'}"
+            + (f" · extra body: {cfg.extra_body}" if cfg.extra_body else "")
+        )
+    elif cmd == "think":
+        if rest.strip():
+            cfg.reasoning_effort = normalize_effort(rest)
+            agent.log.event("reasoning_effort_changed", value=cfg.reasoning_effort)
+            agent.llm._supports_effort = True  # a new value gets a fresh chance
+        ui.info(
+            f"reasoning_effort: {cfg.reasoning_effort or 'off (model default)'}"
+            + ("" if rest.strip() else "   (/think high, /think off)")
+        )
     else:
         ui.warn(f"unknown command /{cmd} — try /help")
     return True
@@ -253,10 +259,14 @@ def run_turn(agent: Agent, message: str) -> None:
     parts = []
     if agent.last_usage:
         usage = agent.last_usage
-        parts.append(
+        detail = (
             f"tokens in={usage.get('prompt_tokens', '?')} "
             f"out={usage.get('completion_tokens', '?')}"
         )
+        thought = agent.last_reasoning_tokens
+        if thought:
+            detail += f" (thinking {thought})"
+        parts.append(detail)
     used = agent.used_tokens()
     parts.append(f"ctx ~{used}/{cfg.context_tokens} ({100 * used / cfg.context_tokens:.0f}%)")
     ui.info(f"  [{cfg.model}] " + " · ".join(parts))
@@ -348,7 +358,7 @@ def main() -> int:
             # Show the shell's directory when it is not the workspace root, so
             # the state the model sees is visible to you as well.
             where = "" if cfg.cwd == cfg.workspace else ui.dim(f"{cfg.cwd_label} ")
-            line = prefix + read_message(where + ui.cyan("> "))
+            line = prefix + read_message(ui.input_prompt(where + ui.cyan("> ")))
             prefix = ""
         except EOFError:
             print()

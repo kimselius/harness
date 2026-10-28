@@ -7,6 +7,26 @@ JSONL transcript of every request, response, tool call and tool result.
 Built for throwaway VPS / container use: there is no sandboxing beyond confining
 file paths to a workspace directory. Do not point it at a machine you care about.
 
+## Platforms
+
+| | Linux | macOS | Windows (native) |
+| --- | --- | --- | --- |
+| REPL, sessions, compaction, logging | yes | yes | yes |
+| Prompt wrapping / line editing | GNU readline | libedit | plain console, or pyreadline3 |
+| Colour | yes | yes | VT enabled at startup, else colour off |
+| Paste kept as one message | yes | yes | no, one line per message |
+| Typing while it works | yes | yes | no, wait for the prompt |
+| `shell` tool | `/bin/sh -c` | `/bin/sh -c` | `cmd.exe`, POSIX syntax will not work |
+| Persistent shell directory | yes | yes | no, stays at the workspace root |
+| Timeout / Ctrl-C kills the whole process tree | yes | yes | direct child only |
+
+Everything platform-specific degrades rather than crashing, but **on Windows use
+WSL or Docker**. Two deliberate non-goals keep the code simple: there is one shell
+implementation (POSIX `sh`) and one way of watching stdin (`select`). Supporting
+`cmd.exe` would mean a second command dialect, a second working-directory probe and
+job objects instead of process groups — doubling the surface of the riskiest tool to
+solve something WSL already solves.
+
 ## Setup
 
 ```sh
@@ -156,8 +176,17 @@ Worth knowing:
 | `/log` | path to this session's JSONL log |
 | `/sessions` | list recorded sessions |
 | `/resume <id>` | load an earlier session (id, prefix, or `last`) |
-| `/limits` | current output limits and timeouts |
+| `/limits` | current output limits, timeouts and reasoning settings |
+| `/think [level]` | show or set `reasoning_effort` (`high`, `low`, `off`, …) |
 | `/exit` | quit (Ctrl-D works too) |
+
+Long lines wrap and edit correctly: colour codes in the prompt are marked
+zero-width (`\001`/`\002`), because GNU readline and libedit otherwise count those
+bytes as columns, wrap early, and then redraw over the start of your line. The
+markers are only used with a line editor known to understand them — CPython's own
+`readline`, whether built against GNU readline (Linux) or libedit (macOS). An
+unrecognised editor such as pyreadline3 gets the prompt untouched, since it would
+print the markers as literal control characters.
 
 Paste freely: a multi-line paste is kept together as one message rather than being
 chopped into one message per line. `input()` returns at the first newline, so the
@@ -538,6 +567,59 @@ always goes to the JSONL log, so nothing is lost for later follow-up. Tune with
 Each user message gets at most `--max-steps` (default 30) tool rounds; on overrun
 the model is told to stop and summarize.
 
+## Thinking
+
+Reasoning is **on by default** at `medium`, settable three ways:
+
+```sh
+main.py --reasoning-effort high        # minimal | low | medium | high | off
+main.py --show-thinking                # print the reasoning as it streams
+```
+```sh
+HARNESS_REASONING_EFFORT=low           # in .env
+```
+```
+/think high                            # mid-session; /think alone shows it
+/think off                             # back to the model's own default
+```
+
+`off` (also `none`, `false`, empty) sends no `reasoning_effort` at all, which leaves
+the model at whatever it does by default — on the Ollama endpoint that means no
+thinking.
+
+The reasoning text is **always written to the session log**, whether or not you
+display it — `llm_response` carries `reasoning`, `reasoning_chars` and
+`reasoning_tokens`. Without `--show-thinking` the terminal just notes the cost
+(`thought for 114 tokens`), and the turn footer shows `(thinking 114)`.
+
+It is never sent back to the model. OpenAI-compatible APIs do not accept reasoning
+in an assistant message, and replaying it would burn context for no benefit, so it
+stays in the log and on your screen only.
+
+Efficiency choices worth knowing:
+
+- Compaction summaries never request thinking, whatever the session setting is.
+  Rewriting a transcript is mechanical, so reasoning tokens there are waste.
+- `reasoning_tokens` are counted as output tokens by the server. At `high` on a
+  31B, a trivial question can spend a few hundred tokens before answering.
+
+### Endpoint differences
+
+Only the standard `reasoning_effort` parameter is sent, so this works across
+endpoints rather than for one vendor. Responses are read tolerantly: reasoning text
+is taken from `reasoning_content` (Ollama, vLLM, DeepSeek), `reasoning`
+(OpenRouter) or `thinking`, and token counts from either
+`completion_tokens_details.reasoning_tokens` (OpenAI) or a flat `reasoning_tokens`.
+
+If an endpoint rejects `reasoning_effort` with a 400, the harness drops the field,
+retries once, warns you, logs `params_dropped`, and stops sending it for the rest of
+the session — a wrong guess costs one retry, not the turn.
+
+For knobs that are not in the OpenAI schema at all, `--extra-body '{"top_k": 40}'`
+(or `HARNESS_EXTRA_BODY`) is merged into the request body and degrades the same way.
+Note that Ollama's native `think` parameter is *not* honoured through its
+OpenAI-compatible endpoint — `reasoning_effort` is the one that works there.
+
 ## Context window and compaction
 
 Before every request the harness estimates the prompt size; past
@@ -589,7 +671,7 @@ the summary text), `compaction_error`, `compaction_skipped`, `tool_result_shrunk
 `history_trimmed`, `history_repaired`, `cwd_set`, `user_message` with
 `queued: true` for steering, `interrupted` (with `where`:
 `request`/`stream`/`tool`/`turn`), `pasted_code_block`, `llm_error`,
-`max_steps_reached`, `session_end`.
+`max_steps_reached`, `params_dropped`, `reasoning_effort_changed`, `session_end`.
 
 `llm_request`/`llm_response` carry `purpose`: `turn` for normal calls,
 `compaction` for summary calls.
@@ -600,6 +682,9 @@ jq -r 'select(.type=="tool_call" and .name=="shell") | .arguments.command' logs/
 
 # token usage per call
 jq -r 'select(.type=="llm_response") | .usage' logs/*.jsonl
+
+# what did it think about, and what did that cost?
+jq -r 'select(.type=="llm_response" and .reasoning != "") | "\(.reasoning_tokens) tokens: \(.reasoning)"' logs/*.jsonl
 
 # what did compaction throw away, and what did it keep?
 jq -r 'select(.type=="compaction") | "\(.tokens_before) -> \(.tokens_after)\n\(.summary)"' logs/*.jsonl
@@ -619,6 +704,8 @@ network:
 .venv/bin/python tests/test_paste.py
 .venv/bin/python tests/test_sessions.py
 .venv/bin/python tests/test_steer.py
+.venv/bin/python tests/test_reasoning.py
+.venv/bin/python tests/test_platform.py
 ```
 
 `test_harness.py` covers the tool loop in streaming and non-streaming mode,
@@ -650,6 +737,15 @@ and a real `git init` / `git diff` in a child directory.
 (`last`, exact, prefix, path, ambiguous, missing), replay fidelity against a live
 history, re-truncation on load, compaction replay, a killed session with a damaged
 line and an unanswered tool call, and `--resume`/`--sessions` as subprocesses.
+
+`test_platform.py` exercises the Windows branches on POSIX by faking what they
+depend on: `os.killpg` and `signal.SIGKILL` removed, a stubbed `msvcrt`, `select()`
+refusing a non-socket, and the cwd probe disabled.
+
+`test_reasoning.py` covers both usage shapes and all three reasoning field names,
+capture in streaming and non-streaming mode, that the text is logged but never
+replayed into history, `--show-thinking`, that summaries omit the parameter, and a
+server that rejects `reasoning_effort` with a 400.
 
 `test_steer.py` covers the queue mechanics (line splitting, blank lines, CRLF,
 leftovers, stop semantics) and then types into a live REPL while a `sleep 3` tool

@@ -15,6 +15,31 @@ import sys
 import threading
 from collections import deque
 
+def read_pending(fd: int, settle: float = 0.05) -> str:
+    """Input already waiting to be read. Empty string if there is none.
+
+    POSIX only in practice: select() cannot watch stdin on Windows, where it
+    raises and this returns "" — pastes then arrive one line per message.
+    """
+    chunks: list[str] = []
+    timeout = 0.0  # a line typed at the prompt must not pay any latency
+    while True:
+        try:
+            ready, _, _ = select.select([fd], [], [], timeout)
+        except (OSError, ValueError):
+            break
+        if not ready:
+            break
+        try:
+            data = os.read(fd, 65536)
+        except OSError:
+            break
+        if not data:
+            break
+        chunks.append(data.decode("utf-8", errors="replace"))
+        timeout = settle  # a paste can arrive in several chunks
+    return "".join(chunks)
+
 
 class InputQueue:
     def __init__(self, fd: int | None = None, poll: float = 0.1) -> None:

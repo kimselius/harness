@@ -29,6 +29,11 @@ REQUESTS: list[dict] = []
 # Set by set_script() to override SCRIPT for a given test.
 ACTIVE: list[tuple[str, list[tuple[str, dict]]]] = SCRIPT
 
+# Reasoning text echoed back as reasoning_content, and the token count reported.
+REASONING: list[str] = []
+# Request body keys that make the server answer 400, for testing degradation.
+REJECT: set[str] = set()
+
 # Append True to make the next request fail with a 500 (retries are exhausted by
 # the SDK, so one entry is enough to surface the error to the caller).
 FAIL_NEXT: list[bool] = []
@@ -38,6 +43,13 @@ def set_script(script: list[tuple[str, list[tuple[str, dict]]]]) -> None:
     """Replace the canned turns and reset the request counter."""
     global ACTIVE
     ACTIVE = script
+    REQUESTS.clear()
+
+
+def reset() -> None:
+    REASONING.clear()
+    REJECT.clear()
+    FAIL_NEXT.clear()
     REQUESTS.clear()
 
 
@@ -51,6 +63,18 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length) or b"{}")
         REQUESTS.append(body)
+        bad = sorted(REJECT & set(body))
+        if bad:
+            payload = json.dumps({
+                "error": {"message": f"unsupported parameter: {bad[0]}",
+                          "type": "invalid_request_error"}
+            }).encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if FAIL_NEXT:
             FAIL_NEXT.pop()
             payload = json.dumps({"error": {"message": "mock failure"}}).encode()
@@ -67,8 +91,16 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._whole(text, calls)
 
+    def _usage(self) -> dict:
+        usage = {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+        if REASONING:
+            usage["reasoning_tokens"] = len(REASONING[0]) // 4
+        return usage
+
     def _message(self, text: str, calls: list[tuple[str, dict]]) -> dict:
         message: dict = {"role": "assistant", "content": text}
+        if REASONING:
+            message["reasoning_content"] = REASONING[0]
         if calls:
             message["tool_calls"] = [
                 {
@@ -100,7 +132,7 @@ class Handler(BaseHTTPRequestHandler):
                     "finish_reason": "tool_calls" if calls else "stop",
                 }
             ],
-            "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+            "usage": self._usage(),
         }
         self._send(json.dumps(payload).encode(), "application/json")
 
@@ -116,6 +148,11 @@ class Handler(BaseHTTPRequestHandler):
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
             }
 
+        # reasoning arrives before content, in its own deltas
+        if REASONING:
+            blob = REASONING[0]
+            for i in range(0, len(blob), 5):
+                chunks.append(frame({"reasoning_content": blob[i : i + 5]}))
         # text split into small pieces to exercise delta accumulation
         for i in range(0, len(text), 4):
             chunks.append(frame({"content": text[i : i + 4]}))
@@ -155,7 +192,7 @@ class Handler(BaseHTTPRequestHandler):
             "created": 0,
             "model": "mock",
             "choices": [],
-            "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+            "usage": self._usage(),
         }
         chunks.append(usage_frame)
 

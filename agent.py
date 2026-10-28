@@ -24,9 +24,11 @@ class _Printer:
     instead of a token at a time; raw mode keeps the token-by-token feel.
     """
 
-    def __init__(self, markdown_on: bool, style: bool) -> None:
+    def __init__(self, markdown_on: bool, style: bool, show_thinking: bool = False) -> None:
         self.markdown_on = markdown_on
         self.style = style
+        self.show_thinking = show_thinking
+        self.thinking_open = False
         self.stream = (
             markdown.StreamRenderer(self._write, style=style) if markdown_on else None
         )
@@ -38,13 +40,30 @@ class _Printer:
             self.started = True
         print(text, end="", flush=True)
 
+    def feed_reasoning(self, chunk: str) -> None:
+        """Streamed reasoning text. Hidden unless asked for, never in history."""
+        if not self.show_thinking:
+            return
+        if not self.thinking_open:
+            print(ui.dim("thinking "), end="", flush=True)
+            self.thinking_open = True
+        print(ui.dim(chunk), end="", flush=True)
+
+    def end_reasoning(self) -> None:
+        if self.thinking_open:
+            print()
+            self.thinking_open = False
+
     def feed(self, chunk: str) -> None:
+        if self.thinking_open:
+            self.end_reasoning()
         if self.stream:
             self.stream.feed(chunk)
         else:
             self._write(chunk)
 
     def finish(self, content: str) -> None:
+        self.end_reasoning()
         if self.stream:
             self.stream.close()
         if not self.started and content.strip():  # non-streaming reply
@@ -68,6 +87,7 @@ class Agent:
         self.meter = context.TokenMeter(toolkit.TOOL_SCHEMAS)
         self.compactions = 0
         self.interrupted = False
+        self.last_reasoning_tokens: int | None = None
         # Optional InputQueue: messages typed while the turn is running.
         self.inbox: Any = None
 
@@ -122,7 +142,7 @@ class Agent:
 
     def _printer(self) -> _Printer:
         style = ui.colors_enabled()
-        return _Printer(self.cfg.markdown and style, style)
+        return _Printer(self.cfg.markdown and style, style, self.cfg.show_thinking)
 
     # -- context accounting ------------------------------------------------
     def used_tokens(self) -> int:
@@ -193,6 +213,7 @@ class Agent:
                 tools=None,
                 model=self.cfg.summary_model,
                 purpose="compaction",
+                effort=None,  # summarizing is mechanical; thinking is wasted here
             )
             return reply.content.strip()
         except Exception as exc:
@@ -238,6 +259,17 @@ class Agent:
             "tool_result_shrunk", index=index, chars_before=size, chars_after=len(shrunk)
         )
         return True
+
+    def _note_reasoning(self, reply: Any) -> None:
+        """Say what the thinking cost when it is not being displayed."""
+        if not reply.reasoning and not reply.reasoning_tokens:
+            return
+        self.last_reasoning_tokens = reply.reasoning_tokens
+        if self.cfg.show_thinking:
+            return
+        tokens = reply.reasoning_tokens
+        size = f"{tokens} tokens" if tokens else f"{len(reply.reasoning)} chars"
+        ui.info(f"  (thought for {size}; --show-thinking to see it)")
 
     def _warn_about_pasted_code(self, content: str, min_lines: int = 8) -> None:
         """Flag replies that dump code instead of writing it to a file."""
@@ -291,7 +323,10 @@ class Agent:
             sent_chars = self.meter.request_chars(messages)
             try:
                 reply = self.llm.complete(
-                    messages, toolkit.TOOL_SCHEMAS, on_text=printer.feed
+                    messages,
+                    toolkit.TOOL_SCHEMAS,
+                    on_text=printer.feed,
+                    on_reasoning=printer.feed_reasoning,
                 )
             except KeyboardInterrupt:
                 # Interrupted while waiting for the model; nothing partial to keep.
@@ -299,6 +334,7 @@ class Agent:
                 self.note_interrupt("request")
                 return final_text
             printer.finish(reply.content)
+            self._note_reasoning(reply)
             self._warn_about_pasted_code(reply.content)
 
             if reply.interrupted:
