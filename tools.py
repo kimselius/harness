@@ -216,10 +216,14 @@ def tool_shell(args: dict, cfg: Config) -> str:
     if isinstance(requested, (int, float)) and requested > 0:
         timeout = min(float(requested), cfg.max_shell_timeout)
 
+    if not cfg.cwd.is_dir():
+        # The directory was removed underneath us. Fall back to the root *and*
+        # record it, so the reported cwd matches where the command really ran.
+        cfg.cwd = cfg.workspace
     proc = subprocess.Popen(
         command + CWD_PROBE,
         shell=True,
-        cwd=str(cfg.cwd if cfg.cwd.is_dir() else cfg.workspace),
+        cwd=str(cfg.cwd),
         env=cfg.child_env(),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -246,7 +250,7 @@ def tool_shell(args: dict, cfg: Config) -> str:
 
     output, notes = _take_cwd(output or "", cfg)
     status = (
-        f"timed out after {timeout:g}s (process group killed)"
+        f"timed out after {timeout:g}s (killed)"
         if timed_out
         else f"exit code: {proc.returncode}"
     )

@@ -181,6 +181,28 @@ def test_repl_command_after_paste(tmp: Path, base_url: str) -> None:
           not [r for r in mock_server.REQUESTS if r.get("messages")])
 
 
+def test_tab_completion_in_the_repl(tmp: Path, base_url: str) -> None:
+    print("tab completion end to end")
+    mock_server.set_script([("ok", [])])
+    (tmp / "tab" / "ws" / "subdir").mkdir(parents=True, exist_ok=True)
+    screen = ptyrun.repl(
+        base_url,
+        tmp / "tab",
+        [
+            (0.0, b"/limi\t"),      # completes to /limits
+            (1.0, b"\n"),
+            (1.0, b"/cwd sub\t"),   # completes to subdir
+            (1.0, b"\n"),
+            (1.0, b"/exit\n"),
+        ],
+        settle=2.0,
+    )
+    check("command completed and ran", "shell timeout" in screen, screen[-400:])
+    check("directory argument completed", "subdir" in screen, screen[-400:])
+    check("no model call for either", not [
+        r for r in mock_server.REQUESTS if r.get("messages")])
+
+
 def main_() -> int:
     server, base_url = mock_server.start()
     import tempfile
@@ -193,6 +215,7 @@ def main_() -> int:
         test_repl_paste(tmp, base_url)
         test_repl_single_line_unchanged(tmp, base_url)
         test_repl_command_after_paste(tmp, base_url)
+        test_tab_completion_in_the_repl(tmp, base_url)
     server.shutdown()
     print()
     if failures:

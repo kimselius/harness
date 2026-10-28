@@ -188,6 +188,48 @@ def test_history_file(tmp: Path, base_url: str) -> None:
     check("writable", path.read_text() == "probe")
 
 
+def test_completion(tmp: Path, base_url: str) -> None:
+    print("command completion")
+    from main import COMMAND_NAMES, completions, setup_completion
+
+    cfg = make_config(tmp / "comp", base_url, stream=False)
+    agent = Agent(cfg, Logbook(cfg.log_path))
+    (cfg.workspace / "subdir" / "nested").mkdir(parents=True, exist_ok=True)
+    (cfg.workspace / ".hidden").mkdir(exist_ok=True)
+
+    check("bare slash offers everything",
+          completions("/", "/", agent) == [f"/{n}" for n in COMMAND_NAMES])
+    check("prefix narrows it", completions("/his", "/his", agent) == ["/history"])
+    check("several matches", sorted(completions("/h", "/h", agent))
+          == ["/help", "/history"])
+    check("unknown prefix gives nothing", completions("/zzz", "/zzz", agent) == [])
+    check("prose is never completed", completions("write a file", "write", agent) == [])
+    check("empty line gives nothing", completions("", "", agent) == [])
+
+    check("think levels", completions("/think ", "", agent)
+          == ["minimal", "low", "medium", "high", "off"])
+    check("think levels filter", completions("/think h", "h", agent) == ["high"])
+    check("history argument", completions("/history ", "", agent) == ["all"])
+    check("commands without arguments", completions("/reset ", "", agent) == [])
+
+    dirs = completions("/cwd ", "", agent)
+    check("cwd offers directories", "subdir" in dirs and "subdir/nested" in dirs,
+          str(dirs))
+    check("cwd skips dotted directories", ".hidden" not in dirs, str(dirs))
+    check("cwd filters by prefix", completions("/cwd sub", "sub", agent) == [
+        "subdir", "subdir/nested"])
+
+    agent.log.event("user_message", content="x")  # make the session file exist
+    resumable = completions("/resume ", "", agent)
+    check("resume offers last", resumable[0] == "last", str(resumable[:2]))
+    check("resume offers session ids", agent.log.session_id in resumable,
+          str(resumable[:3]))
+
+    # Binding Tab must not raise whatever the backend is.
+    check("setup_completion returns a bool",
+          isinstance(setup_completion(agent), bool))
+
+
 def test_commands(tmp: Path, base_url: str) -> None:
     print("repl commands")
     from main import handle_command
@@ -214,6 +256,7 @@ def main() -> int:
         test_loop(tmp, base_url, stream=True)
         test_repair(tmp, base_url)
         test_history_file(tmp, base_url)
+        test_completion(tmp, base_url)
         test_commands(tmp, base_url)
     server.shutdown()
     print()

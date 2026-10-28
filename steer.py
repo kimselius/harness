@@ -15,6 +15,7 @@ import sys
 import threading
 from collections import deque
 
+
 def read_pending(fd: int, settle: float = 0.05) -> str:
     """Input already waiting to be read. Empty string if there is none.
 

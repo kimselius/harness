@@ -180,6 +180,13 @@ Worth knowing:
 | `/think [level]` | show or set `reasoning_effort` (`high`, `low`, `off`, …) |
 | `/exit` | quit (Ctrl-D works too) |
 
+Tab completes command names (`/his` → `/history`) and their arguments: levels for
+`/think`, session ids for `/resume`, workspace directories for `/cwd`. Plain prose
+is never completed, so Tab stays out of the way when you are writing a message.
+`/help` is generated from the same command list the completer uses, so the two
+cannot drift apart. (Binding Tab differs between GNU readline and libedit; both are
+handled.)
+
 Long lines wrap and edit correctly: colour codes in the prompt are marked
 zero-width (`\001`/`\002`), because GNU readline and libedit otherwise count those
 bytes as columns, wrap early, and then redraw over the start of your line. The
@@ -644,7 +651,7 @@ keeps the recent tail verbatim.
 | --- | --- | --- |
 | `--context-tokens` | 32000 | usable window |
 | `--compact-at` | 0.75 | fraction of the window that triggers compaction |
-| `--compact-keep` | 0.25 | fraction kept verbatim as recent history |
+| `--compact-keep` | 0.25 | fraction kept verbatim as recent history (must be below `--compact-at`) |
 | `--summary-model` | main model | model used to write the summary |
 | `--no-compact` | off | disable compaction entirely |
 
@@ -669,9 +676,11 @@ What survives a compaction:
 3. The most recent `--compact-keep` worth of messages, verbatim.
 
 Split points never separate an assistant `tool_calls` message from its results, so
-the history stays valid for strict APIs. If the kept tail still doesn't fit, big
-tool results are shrunk in place before any message is dropped — losing the tail of
-an output is cheaper than losing a whole result the model just worked for. A failed
+the history stays valid for strict APIs. If the kept tail still doesn't fit, the
+biggest message is shrunk in place before anything is dropped, tool results first,
+since losing the tail of a command's output is cheaper than losing a whole result
+the model just worked for. A single pasted message larger than the window is shrunk
+too, because the last message can never be dropped. A failed
 summary call degrades to dropping the old messages with a placeholder rather than
 overflowing the window.
 
@@ -681,7 +690,7 @@ One JSON object per line, with `ts`, `session`, `seq`, `type`. Types:
 `session_start`, `session_resumed`, `session_restored`, `user_message`, `llm_request` (full message array sent),
 `llm_response` (content, tool calls, usage), `tool_call`, `tool_result` (full
 output, duration, truncation flag), `compaction` (token counts before/after plus
-the summary text), `compaction_error`, `compaction_skipped`, `tool_result_shrunk`,
+the summary text), `compaction_error`, `compaction_skipped`, `message_shrunk`,
 `history_trimmed`, `history_repaired`, `cwd_set`, `user_message` with
 `queued: true` for steering, `interrupted` (with `where`:
 `request`/`stream`/`tool`/`turn`), `pasted_code_block`, `llm_error`,

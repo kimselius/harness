@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
 from typing import Any
+
 
 def _enable_windows_vt() -> bool:
     """Turn on ANSI handling in the Windows console. True if colour is usable."""
@@ -106,9 +108,15 @@ def input_prompt(text: str) -> str:
     return _ANSI.sub("\001\\1\002", text)
 
 
-def _one_line(text: str, width: int = 100) -> str:
+def one_line(text: str, width: int | None = None) -> str:
+    """Collapse to a single line, ending with … when it had to be shortened."""
+    if width is None:
+        width = max(40, shutil.get_terminal_size(fallback=(100, 24)).columns - 6)
     flat = " ".join(str(text).split())
     return flat if len(flat) <= width else flat[: width - 1] + "…"
+
+
+_one_line = one_line  # internal alias
 
 
 def tool_call(name: str, args: dict) -> None:

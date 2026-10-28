@@ -235,25 +235,26 @@ def test_disabled(tmp: Path, base_url: str) -> None:
 
 def test_trim_guard(tmp: Path, base_url: str) -> None:
     print("trim fallback")
-    mock_server.REQUESTS.clear()
     mock_server.set_script([("tiny summary", [])])
-    # Keep fraction larger than the trigger, so the kept tail alone still
-    # overflows and the trim fallback has to run.
-    agent = make_agent(
-        tmp / "c5",
-        base_url,
-        ["--context-tokens", "6000", "--compact-at", "0.3", "--compact-keep", "0.6"],
-    )
-    agent.history = bulk_history(30)
+    agent = make_agent(tmp / "c5", base_url, ["--context-tokens", "6000"])
+    # A single pasted message larger than the whole trigger. Compaction keeps at
+    # least one message, so the kept tail alone overflows and must be dropped;
+    # there are no tool results to shrink first.
+    agent.history = bulk_history(4) + [
+        {"role": "user", "content": "huge " + "x" * 20000}
+    ]
     agent.compact(reason="test")
     check("trimmed under threshold",
           agent.used_tokens() < agent.cfg.compact_threshold, str(agent.used_tokens()))
     check("summary survived trim",
           agent.history[0]["content"].startswith(context.SUMMARY_HEADER))
+    check("the oversized message was shrunk, not dropped",
+          any((m.get("content") or "").startswith("huge ") for m in agent.history[1:]))
     check("pairing intact", pairing_ok(agent.history))
     recs = [json.loads(l) for l in agent.cfg.log_path.read_text().splitlines()]
-    check("trim logged", any(r["type"] in ("history_trimmed", "tool_result_shrunk")
-                             for r in recs))
+    check("shrink logged", any(r["type"] == "message_shrunk" for r in recs))
+    check("it was the pasted message",
+          any(r["type"] == "message_shrunk" and r["role"] == "user" for r in recs))
 
 
 def test_shrink_before_drop(tmp: Path, base_url: str) -> None:
@@ -281,7 +282,7 @@ def test_shrink_before_drop(tmp: Path, base_url: str) -> None:
           str(agent.used_tokens()))
     check("pairing intact", pairing_ok(agent.history))
     recs = [json.loads(l) for l in agent.cfg.log_path.read_text().splitlines()]
-    check("shrink logged", any(r["type"] == "tool_result_shrunk" for r in recs))
+    check("shrink logged", any(r["type"] == "message_shrunk" for r in recs))
 
 
 def main() -> int:

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-import ui
 from openai import BadRequestError, OpenAI
 
+import ui
 from config import Config
 from logbook import Logbook
 
@@ -131,20 +131,37 @@ class LLM:
             params["extra_body"] = dict(self.cfg.extra_body)
         return params
 
-    def _without_unsupported(self, params: dict[str, Any]) -> dict[str, Any] | None:
-        """Drop provider-specific fields after a rejection. None if none were sent."""
-        dropped = []
+    def _without_unsupported(
+        self, params: dict[str, Any], error: Exception
+    ) -> dict[str, Any] | None:
+        """Drop provider-specific fields after a rejection.
+
+        Returns None when the rejection has nothing to do with the fields we
+        added, so an unrelated 400 (a bad model name, a malformed message) keeps
+        its own error instead of being reported as an unsupported parameter.
+        """
+        sent = [name for name in ("reasoning_effort",) if name in params]
+        sent += sorted(self.cfg.extra_body or {}) if params.get("extra_body") else []
+        if not sent:
+            return None
+        blamed = [name for name in sent if name in str(error)]
+        if not blamed:
+            # The server did not name any of them, so assume they are innocent.
+            return None
+
         params = dict(params)
-        if "reasoning_effort" in params:
-            params.pop("reasoning_effort")
+        dropped = []
+        if "reasoning_effort" in blamed:
+            params.pop("reasoning_effort", None)
             self._supports_effort = False
             dropped.append("reasoning_effort")
-        if params.pop("extra_body", None):
+        if any(key in blamed for key in (self.cfg.extra_body or {})):
+            params.pop("extra_body", None)
             self._supports_extra_body = False
             dropped.extend(sorted(self.cfg.extra_body or {}))
         if not dropped:
             return None
-        self.log.event("params_dropped", fields=dropped, reason="server rejected them")
+        self.log.event("params_dropped", fields=dropped, reason=str(error)[:200])
         ui.warn(f"! this endpoint rejected {', '.join(dropped)}; continuing without")
         return params
 
@@ -175,12 +192,13 @@ class LLM:
         )
         try:
             reply = self._dispatch(params, on_text, on_reasoning)
-        except BadRequestError:
+        except BadRequestError as exc:
             # Some OpenAI-compatible servers reject reasoning_effort outright.
-            # Drop the provider-specific fields once and retry, rather than
-            # failing the turn.
-            retry = self._without_unsupported(params)
+            # Drop the fields they name and retry once, rather than failing the
+            # turn — but only when the error actually blames one of them.
+            retry = self._without_unsupported(params, exc)
             if retry is None:
+                self.log.event("llm_error", error=f"{type(exc).__name__}: {exc}")
                 raise
             reply = self._dispatch(retry, on_text, on_reasoning)
         except Exception as exc:

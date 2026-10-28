@@ -425,6 +425,19 @@ def config_from_args(args: argparse.Namespace) -> Config:
         if not isinstance(extra_body, dict):
             sys.exit("--extra-body must be a JSON object")
 
+    # Keeping more than the trigger allows is incoherent: every compaction would
+    # immediately have to shrink or drop what it just decided to keep.
+    compact_at = min(0.95, max(0.3, args.compact_at))
+    compact_keep = min(0.6, max(0.05, args.compact_keep))
+    if compact_keep >= compact_at:
+        clamped = max(0.05, round(compact_at - 0.15, 2))
+        print(
+            f"warning: --compact-keep {compact_keep} is not below --compact-at "
+            f"{compact_at}; using {clamped}",
+            file=sys.stderr,
+        )
+        compact_keep = clamped
+
     log_dir = anchor(args.log_dir)
     resumed = False
     if args.resume is not None:
@@ -454,8 +467,8 @@ def config_from_args(args: argparse.Namespace) -> Config:
         prompt_file=anchor(args.prompt_file),
         resumed=resumed,
         context_tokens=max(2000, args.context_tokens),
-        compact_at=min(0.95, max(0.3, args.compact_at)),
-        compact_keep=min(0.6, max(0.05, args.compact_keep)),
+        compact_at=compact_at,
+        compact_keep=compact_keep,
         compact=not args.no_compact,
         summary_model=args.summary_model,
         markdown=not args.no_markdown,

@@ -4,12 +4,11 @@
 from __future__ import annotations
 
 import atexit
-import os
+import json
 import sys
 from pathlib import Path
 
 import context
-import json
 import markdown
 import sessions
 import steer
@@ -17,8 +16,8 @@ import tools as toolkit
 import ui
 from agent import Agent
 from config import (
-    BASE_DIR,
     Config,
+    anchor,
     build_parser,
     config_from_args,
     load_dotenv,
@@ -35,29 +34,102 @@ def history_file(cfg: Config) -> Path:
     """
     return cfg.log_path.parent / ".harness_history"
 
-HELP = """\
-commands
-  /help              this list
-  /tools             list available tools
-  /model [name]      show or switch model
-  /prompt            show the active system prompt
-  /history [n|all]   replay the conversation (default: last 12 messages)
-  /cwd [dir]         show or set the shell's working directory
-  /context           token usage vs the context window
-  /compact           summarize history now
-  /reset             clear conversation history
-  /log               path to the JSONL session log
-  /sessions          list recorded sessions
-  /resume <id>       load an earlier session (id, prefix, or "last")
-  /limits            current output/timeout limits and reasoning settings
-  /think [level]     show or set reasoning_effort (high, low, off, ...)
-  /exit, /quit       leave (Ctrl-D also works)
-input
+# One list, so /help and tab completion cannot drift apart.
+COMMANDS: list[tuple[str, str, str]] = [
+    ("help", "", "this list"),
+    ("tools", "", "list available tools"),
+    ("model", "[name]", "show or switch model"),
+    ("prompt", "", "show the active system prompt"),
+    ("history", "[n|all]", "replay the conversation (default: last 12 messages)"),
+    ("cwd", "[dir]", "show or set the shell's working directory"),
+    ("context", "", "token usage vs the context window"),
+    ("compact", "", "summarize history now"),
+    ("think", "[level]", "show or set reasoning_effort (high, low, off, ...)"),
+    ("limits", "", "current output/timeout limits and reasoning settings"),
+    ("reset", "", "clear conversation history"),
+    ("log", "", "path to the JSONL session log"),
+    ("sessions", "", "list recorded sessions"),
+    ("resume", "<id>", "load an earlier session (id, prefix, or \"last\")"),
+    ("exit", "", "leave (also /quit, /q, or Ctrl-D)"),
+]
+COMMAND_NAMES = [name for name, _, _ in COMMANDS]
+
+THINK_LEVELS = ["minimal", "low", "medium", "high", "off"]
+
+HELP = (
+    "commands\n"
+    + "".join(
+        f"  /{name + (' ' + args if args else ''):<18} {description}\n"
+        for name, args, description in COMMANDS
+    )
+    + """input
   type while busy    messages are queued and picked up at the next step
   paste              multi-line pastes are kept together as one message
   <<<                type a multi-line message, end with a line containing >>>
+  Tab                complete command names and their arguments
   Ctrl-C             interrupt the running turn (kills any running command)
 """
+)
+
+
+def completions(buffer: str, text: str, agent: Agent) -> list[str]:
+    """Tab completions for the current line. Only commands, never prose."""
+    line = buffer.lstrip()
+    if not line.startswith("/"):
+        return []
+    head, space, _ = line.partition(" ")
+    if not space:  # still typing the command itself
+        prefix = head[1:].lower()
+        return [f"/{name}" for name in COMMAND_NAMES if name.startswith(prefix)]
+
+    cmd = head[1:].lower()
+    options: list[str] = []
+    if cmd == "think":
+        options = THINK_LEVELS
+    elif cmd == "history":
+        options = ["all"]
+    elif cmd == "resume":
+        options = ["last"] + [
+            path.stem for path in sessions.session_files(agent.cfg.log_path.parent)
+        ]
+    elif cmd == "cwd":
+        root = agent.cfg.workspace
+        options = sorted(
+            str(path.relative_to(root))
+            for path in root.rglob("*")
+            if path.is_dir() and not path.name.startswith(".")
+        )[:200]
+    elif cmd == "model":
+        options = [agent.cfg.model]
+    return [option for option in options if option.startswith(text)]
+
+
+def setup_completion(agent: Agent) -> bool:
+    """Bind Tab to the command completer. False if readline cannot do it."""
+    try:
+        import readline
+    except ImportError:
+        return False
+
+    def complete(text: str, state: int):
+        try:
+            matches = completions(readline.get_line_buffer(), text, agent)
+        except Exception:
+            return None  # never let completion break the prompt
+        return matches[state] if state < len(matches) else None
+
+    readline.set_completer(complete)
+    # Keep "/" and "-" out of the delimiters so whole commands and session ids
+    # are offered as single words.
+    readline.set_completer_delims(" \t\n")
+    try:
+        if getattr(readline, "backend", "") == "editline":
+            readline.parse_and_bind("bind ^I rl_complete")  # libedit syntax
+        else:
+            readline.parse_and_bind("tab: complete")
+    except Exception:
+        return False
+    return True
 
 
 def setup_readline(path: Path) -> None:
@@ -161,6 +233,7 @@ def handle_command(line: str, agent: Agent) -> bool:
     elif cmd == "model":
         if rest.strip():
             cfg.model = rest.strip()
+            agent.model_changed()
             agent.log.event("model_changed", model=cfg.model)
         ui.info(f"model: {cfg.model}  base_url: {cfg.base_url or 'api.openai.com'}")
     elif cmd == "prompt":
@@ -173,7 +246,7 @@ def handle_command(line: str, agent: Agent) -> bool:
             if argument in ("all", "full"):
                 print_transcript(agent, limit=None)
             elif argument.isdigit():
-                print_transcript(agent, limit=int(argument))
+                print_transcript(agent, limit=max(1, int(argument)))
             else:
                 print_transcript(agent)
     elif cmd == "context":
@@ -201,9 +274,10 @@ def handle_command(line: str, agent: Agent) -> bool:
             target = (cfg.workspace / rest.strip()).resolve()
             if not target.is_dir():
                 ui.warn(f"no such directory: {rest.strip()}")
-            elif not cfg.set_cwd(target):
-                ui.warn("outside the workspace, reset to the root")
-            agent.log.event("cwd_set", cwd=str(cfg.cwd))
+            else:
+                if not cfg.set_cwd(target):
+                    ui.warn("outside the workspace, reset to the root")
+                agent.log.event("cwd_set", cwd=str(cfg.cwd))
         ui.info(f"{cfg.cwd}  (workspace root: {cfg.workspace})")
     elif cmd == "log":
         ui.info(f"{cfg.log_path}  (session {agent.log.session_id})")
@@ -232,7 +306,7 @@ def handle_command(line: str, agent: Agent) -> bool:
             f"max steps: {cfg.max_steps}"
         )
         ui.info(
-            f"reasoning_effort: {cfg.reasoning_effort or '(model default)'} · "
+            f"reasoning_effort: {cfg.reasoning_effort or 'off (model default)'} · "
             f"show thinking: {'yes' if cfg.show_thinking else 'no'}"
             + (f" · extra body: {cfg.extra_body}" if cfg.extra_body else "")
         )
@@ -310,7 +384,7 @@ def print_transcript(agent: Agent, limit: int | None = TRANSCRIPT_TAIL) -> None:
         if role == "user":
             # Harness-authored messages are context, not something you typed.
             if content.startswith(("[harness]", "<state>", context.SUMMARY_HEADER)):
-                ui.info(f"  {content.splitlines()[0][:100]}")
+                ui.info("  " + ui.one_line(content))
             else:
                 print(ui.cyan("> ") + content)
         elif role == "assistant":
@@ -338,7 +412,7 @@ def restore(agent: Agent) -> dict:
     # A killed process can leave tool calls unanswered; make the history valid.
     agent.repair_history(reason="not recorded in the session log")
     if history:
-        agent.history.append({"role": "user", "content": sessions.context.RESUME_NOTE})
+        agent.history.append({"role": "user", "content": context.RESUME_NOTE})
     agent.log.event(
         "session_restored",
         messages=len(agent.history),
@@ -367,9 +441,7 @@ def main() -> int:
     load_dotenv()
     args = build_parser().parse_args()
     if args.sessions:
-        list_sessions(Path(args.log_dir).expanduser()
-                      if Path(args.log_dir).is_absolute()
-                      else (BASE_DIR / args.log_dir))
+        list_sessions(anchor(args.log_dir))
         return 0
     cfg = config_from_args(args)
     log = Logbook(cfg.log_path)
@@ -390,6 +462,7 @@ def main() -> int:
         return 130 if agent.interrupted else 0  # 130 = terminated by SIGINT
 
     setup_readline(history_file(cfg))
+    setup_completion(agent)
     agent.inbox = steer.InputQueue()
     agent.inbox.on_queued = lambda text: ui.info("» queued, will be sent next step")
     print(

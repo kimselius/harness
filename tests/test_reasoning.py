@@ -231,6 +231,45 @@ def test_graceful_degradation(tmp: Path, base_url: str) -> None:
     mock_server.reset()
 
 
+def test_unrelated_400_is_not_blamed_on_parameters(tmp: Path, base_url: str) -> None:
+    print("unrelated 400s keep their own error")
+    from openai import BadRequestError
+
+    mock_server.reset()
+    mock_server.set_script([("never reached", [])])
+    mock_server.REJECT.add("messages")  # a 400 that names something we always send
+    agent = make_agent(tmp / "unrelated", base_url,
+                       ["--reasoning-effort", "high", "--no-stream"])
+    out = io.StringIO()
+    raised = None
+    try:
+        with redirect_stdout(out):
+            agent.run("hello")
+    except BadRequestError as exc:
+        raised = exc
+    check("the real error surfaces", raised is not None, "no exception")
+    check("not blamed on reasoning_effort", "rejected" not in out.getvalue(),
+          out.getvalue()[:160])
+    check("effort still enabled for later calls", agent.llm._supports_effort)
+    check("logged as an llm_error",
+          any(r["type"] == "llm_error" for r in records(agent)))
+    mock_server.reset()
+
+
+def test_model_change_resets_calibration(tmp: Path, base_url: str) -> None:
+    print("switching model resets calibration")
+    mock_server.reset()
+    mock_server.set_script([("ok", [])])
+    agent = make_agent(tmp / "switch", base_url, ["--no-stream"])
+    agent.meter.calibrate(agent.meter.request_chars([{"role": "user", "content": "x" * 400}]), 100)
+    check("calibrated", agent.meter.samples == 1)
+    agent.llm._supports_effort = False
+    agent.model_changed()
+    check("calibration forgotten", agent.meter.samples == 0)
+    check("tool schemas still counted", agent.meter.tools_chars > 500)
+    check("dropped parameters get another chance", agent.llm._supports_effort)
+
+
 def test_printer_interleaving() -> None:
     print("printer ordering")
     out = io.StringIO()
@@ -267,6 +306,8 @@ def main_() -> int:
         test_summaries_do_not_think(tmp, base_url)
         test_extra_body(tmp, base_url)
         test_graceful_degradation(tmp, base_url)
+        test_unrelated_400_is_not_blamed_on_parameters(tmp, base_url)
+        test_model_change_resets_calibration(tmp, base_url)
         test_printer_interleaving()
     server.shutdown()
     print()

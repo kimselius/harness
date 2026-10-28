@@ -11,9 +11,9 @@ import markdown
 import tools as toolkit
 import ui
 from config import Config
+from context import INTERRUPT_NOTE, SUMMARY_FALLBACK, step_limit_note
 from llm import LLM
 from logbook import Logbook
-from context import INTERRUPT_NOTE, SUMMARY_FALLBACK, step_limit_note
 from util import ToolError, ToolInterrupted, truncate
 
 
@@ -90,6 +90,12 @@ class Agent:
         self.last_reasoning_tokens: int | None = None
         # Optional InputQueue: messages typed while the turn is running.
         self.inbox: Any = None
+
+    def model_changed(self) -> None:
+        """Forget tokenizer calibration and let dropped parameters be retried."""
+        self.meter = context.TokenMeter(toolkit.TOOL_SCHEMAS)
+        self.llm._supports_effort = True
+        self.llm._supports_extra_body = True
 
     def attach_log(self, log: Logbook) -> None:
         """Point the agent and its client at another session's log."""
@@ -231,7 +237,7 @@ class Agent:
         guard = 0
         while self.used_tokens() >= self.cfg.compact_threshold and guard < 500:
             guard += 1
-            if self._shrink_largest_tool_result():
+            if self._shrink_largest_message():
                 continue
             if len(self.history) <= 2:
                 return  # nothing safe left to remove
@@ -243,28 +249,44 @@ class Agent:
                 "history_trimmed", role=dropped.get("role"), tokens=self.used_tokens()
             )
 
-    def _shrink_largest_tool_result(self, floor: int = 600) -> bool:
-        """Halve the biggest tool result still above `floor` chars. False if none."""
-        candidates = [
-            (len(m.get("content") or ""), i)
-            for i, m in enumerate(self.history)
-            if m.get("role") == "tool" and len(m.get("content") or "") > floor * 2
-        ]
+    def _shrink_largest_message(self, floor: int = 600) -> bool:
+        """Halve the biggest oversized message. False when there is nothing left.
+
+        Tool results go first because losing the tail of a command's output is
+        the cheapest thing to lose. Only when none are left does it touch a user
+        or assistant message — which matters for a single pasted message larger
+        than the whole window, where dropping is not an option because the last
+        message always has to stay.
+        """
+        def oversized(roles: tuple[str, ...]) -> list[tuple[int, int]]:
+            return [
+                (len(m.get("content") or ""), i)
+                for i, m in enumerate(self.history)
+                if m.get("role") in roles and len(m.get("content") or "") > floor * 2
+            ]
+
+        candidates = oversized(("tool",)) or oversized(("user", "assistant"))
         if not candidates:
             return False
         size, index = max(candidates)
         shrunk, _ = truncate(self.history[index]["content"], max(floor, size // 2), 10**9)
         self.history[index]["content"] = shrunk
         self.log.event(
-            "tool_result_shrunk", index=index, chars_before=size, chars_after=len(shrunk)
+            "message_shrunk",
+            index=index,
+            role=self.history[index].get("role"),
+            chars_before=size,
+            chars_after=len(shrunk),
         )
         return True
 
     def _note_reasoning(self, reply: Any) -> None:
         """Say what the thinking cost when it is not being displayed."""
+        # Always overwrite, including with None: otherwise a turn that did not
+        # think still shows the previous turn's count in the footer.
+        self.last_reasoning_tokens = reply.reasoning_tokens
         if not reply.reasoning and not reply.reasoning_tokens:
             return
-        self.last_reasoning_tokens = reply.reasoning_tokens
         if self.cfg.show_thinking:
             return
         tokens = reply.reasoning_tokens
@@ -291,7 +313,8 @@ class Agent:
         for message in messages:
             self.history.append({"role": "user", "content": message})
             self.log.event("user_message", content=message, queued=True)
-            ui.info(f"+ your message was added to the context: {message[:60]}")
+            ui.info("+ your message was added to the context: "
+                    + ui.one_line(message, 60))
         return len(messages)
 
     # -- interruption ------------------------------------------------------
@@ -309,6 +332,7 @@ class Agent:
         self.history.append({"role": "user", "content": user_message})
         self.log.event("user_message", content=user_message)
         self.interrupted = False
+        self.last_reasoning_tokens = None
         final_text = ""
 
         for step in range(1, self.cfg.max_steps + 1):
@@ -354,7 +378,7 @@ class Agent:
             if not reply.tool_calls:
                 return final_text
 
-            for index, call in enumerate(reply.tool_calls):
+            for call in reply.tool_calls:
                 if self.interrupted:
                     # Don't start the remaining calls of an interrupted round, but
                     # still answer them so the history stays well formed.
