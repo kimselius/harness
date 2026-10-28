@@ -168,7 +168,7 @@ Worth knowing:
 | `/tools` | list tools and their arguments |
 | `/model [name]` | show or switch model mid-session |
 | `/prompt` | print the active system prompt |
-| `/history` | message count in context |
+| `/history [n\|all]` | replay the conversation (default: last 12 messages) |
 | `/cwd [dir]` | show or set the shell's working directory |
 | `/context` | token usage vs the window, plus the calibrated chars/token |
 | `/compact` | summarize history now |
@@ -207,8 +207,8 @@ Every run is a session with an id like `20261026-105057-b1c53e`, and its log is
 .venv/bin/python main.py --resume 20261026-10  # unambiguous prefix is enough
 ```
 
-Resuming replays the conversation from the log and appends new events to that same
-file, so one session stays one file however many times you come back to it.
+Resuming replays the conversation from the log, prints it to the terminal so you
+can see where you left off, and appends new events to that same file, so one session stays one file however many times you come back to it.
 `seq` numbering continues where it stopped. In the REPL, `/sessions` lists and
 `/resume <id>` switches without restarting.
 
@@ -223,6 +223,13 @@ The log is the only state, so a session survives the process being killed:
   back at its compacted size instead of re-expanding to everything.
 - A note is appended telling the model it is a new process, so it does not assume a
   command it started earlier is still running.
+
+The replay shows the last 12 messages in the same shapes a live turn uses — your
+prompts, tool calls, tool results, replies — with a count of anything older.
+`/history all` prints the lot, `/history 40` a specific number. Harness-authored
+messages (the resume note, compaction summaries) are indented and dimmed rather than
+shown as things you typed. One-shot `-p` runs skip the replay so their output stays
+machine-readable.
 
 What is *not* restored: the shell's working directory (back to the workspace root)
 and anything the earlier process had in memory. Files in `workspace/` are untouched,
@@ -401,8 +408,8 @@ Every run is a session with an id like `20261026-105057-b1c53e`, and its log is
 .venv/bin/python main.py --resume 20261026-10  # unambiguous prefix is enough
 ```
 
-Resuming replays the conversation from the log and appends new events to that same
-file, so one session stays one file however many times you come back to it.
+Resuming replays the conversation from the log, prints it to the terminal so you
+can see where you left off, and appends new events to that same file, so one session stays one file however many times you come back to it.
 `seq` numbering continues where it stopped. In the REPL, `/sessions` lists and
 `/resume <id>` switches without restarting.
 
@@ -417,6 +424,13 @@ The log is the only state, so a session survives the process being killed:
   back at its compacted size instead of re-expanding to everything.
 - A note is appended telling the model it is a new process, so it does not assume a
   command it started earlier is still running.
+
+The replay shows the last 12 messages in the same shapes a live turn uses — your
+prompts, tool calls, tool results, replies — with a count of anything older.
+`/history all` prints the lot, `/history 40` a specific number. Harness-authored
+messages (the resume note, compaction summaries) are indented and dimmed rather than
+shown as things you typed. One-shot `-p` runs skip the replay so their output stays
+machine-readable.
 
 What is *not* restored: the shell's working directory (back to the workspace root)
 and anything the earlier process had in memory. Files in `workspace/` are untouched,

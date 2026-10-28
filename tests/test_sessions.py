@@ -309,6 +309,84 @@ def test_cli_resume(tmp: Path, base_url: str) -> None:
           and "no session matching" in (bad.stderr + bad.stdout), bad.stderr[-200:])
 
 
+def test_transcript_rendering(tmp: Path, base_url: str) -> None:
+    print("transcript rendering")
+    import io
+    from contextlib import redirect_stdout
+
+    import main as cli
+
+    mock_server.set_script(
+        [("", [("shell", {"command": "ls -la"})]), ("all finished", [])]
+    )
+    agent = make_agent(tmp / "render", base_url)
+    with redirect_stdout(io.StringIO()):
+        agent.run("look around")
+
+    out = io.StringIO()
+    with redirect_stdout(out):
+        cli.print_transcript(agent, limit=None)
+    screen = out.getvalue()
+    check("user message shown", "look around" in screen, screen[:120])
+    check("tool call shown", "ls -la" in screen and "shell" in screen, screen[:200])
+    check("tool result shown", "exit code" in screen, screen[:300])
+    check("assistant reply shown", "all finished" in screen)
+
+    # Harness-authored messages are marked, not shown as things you typed.
+    agent.history.append({"role": "user", "content": context.RESUME_NOTE})
+    out = io.StringIO()
+    with redirect_stdout(out):
+        cli.print_transcript(agent, limit=None)
+    lines = [l for l in out.getvalue().splitlines() if "resumed in a new process" in l]
+    check("harness note is indented, not prompted", lines and lines[0].startswith("  "),
+          repr(lines[0]) if lines else "missing")
+
+    # Long sessions show a tail plus a count of what was skipped.
+    agent.history = [{"role": "user", "content": f"message {i}"} for i in range(30)]
+    out = io.StringIO()
+    with redirect_stdout(out):
+        cli.print_transcript(agent)
+    screen = out.getvalue()
+    check("only the tail is printed", "message 29" in screen and "message 0" not in screen)
+    check("says how many were hidden", "18 earlier messages" in screen, screen[:120])
+    out = io.StringIO()
+    with redirect_stdout(out):
+        cli.print_transcript(agent, limit=None)
+    check("limit=None shows everything", "message 0" in out.getvalue())
+
+    # An unparseable tool call must not crash the replay.
+    agent.history = [{
+        "role": "assistant", "content": "",
+        "tool_calls": [{"id": "x", "type": "function",
+                        "function": {"name": "shell", "arguments": "{bad json"}}],
+    }]
+    out = io.StringIO()
+    with redirect_stdout(out):
+        cli.print_transcript(agent, limit=None)
+    check("broken arguments survive", "shell" in out.getvalue(), out.getvalue()[:120])
+
+
+def test_resume_shows_the_conversation(tmp: Path, base_url: str) -> None:
+    print("resume replays to the screen")
+    import ptyrun
+
+    mock_server.set_script([("the first answer", [])])
+    first = make_agent(tmp / "replay", base_url)
+    first.run("remember the pelican")
+    sid = first.log.session_id
+
+    mock_server.set_script([("the second answer", [])])
+    screen = ptyrun.repl(
+        base_url, tmp / "replay", [(0.0, b"/exit\n")], extra_args=["--resume", sid]
+    )
+    check("says what it resumed", f"resumed {sid}" in screen, screen[:200])
+    check("earlier user message on screen", "remember the pelican" in screen,
+          screen[:400])
+    check("earlier reply on screen", "the first answer" in screen, screen[:400])
+    check("banner comes first",
+          screen.index("harness") < screen.index("remember the pelican"), screen[:160])
+
+
 def main_() -> int:
     server, base_url = mock_server.start()
     with tempfile.TemporaryDirectory() as raw:
@@ -323,6 +401,8 @@ def main_() -> int:
         test_summarize_listing(tmp, base_url)
         test_resume_appends(tmp, base_url)
         test_cli_resume(tmp, base_url)
+        test_transcript_rendering(tmp, base_url)
+        test_resume_shows_the_conversation(tmp, base_url)
     server.shutdown()
     print()
     if failures:

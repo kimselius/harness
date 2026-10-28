@@ -8,6 +8,9 @@ import os
 import sys
 from pathlib import Path
 
+import context
+import json
+import markdown
 import sessions
 import steer
 import tools as toolkit
@@ -38,7 +41,7 @@ commands
   /tools             list available tools
   /model [name]      show or switch model
   /prompt            show the active system prompt
-  /history           message count in context
+  /history [n|all]   replay the conversation (default: last 12 messages)
   /cwd [dir]         show or set the shell's working directory
   /context           token usage vs the context window
   /compact           summarize history now
@@ -165,6 +168,14 @@ def handle_command(line: str, agent: Agent) -> bool:
         print(cfg.system_prompt())
     elif cmd == "history":
         ui.info(f"{len(agent.history)} messages in context")
+        if agent.history:
+            argument = rest.strip().lower()
+            if argument in ("all", "full"):
+                print_transcript(agent, limit=None)
+            elif argument.isdigit():
+                print_transcript(agent, limit=int(argument))
+            else:
+                print_transcript(agent)
     elif cmd == "context":
         used = agent.used_tokens()
         pct = 100 * used / cfg.context_tokens
@@ -213,7 +224,7 @@ def handle_command(line: str, agent: Agent) -> bool:
             agent.attach_log(Logbook(path))
             cfg.log_path = path
             agent.log.session_start(cfg, resumed=True)
-            restore(agent)
+            report_resume(agent, restore(agent))
     elif cmd == "limits":
         ui.info(
             f"output: {cfg.max_output_chars} chars / {cfg.max_output_lines} lines · "
@@ -283,8 +294,42 @@ def list_sessions(log_dir: Path, limit: int = 20) -> None:
         ui.info(f"… and {len(files) - limit} older")
 
 
-def restore(agent: Agent) -> None:
-    """Load an earlier session's conversation into the agent."""
+TRANSCRIPT_TAIL = 12
+
+
+def print_transcript(agent: Agent, limit: int | None = TRANSCRIPT_TAIL) -> None:
+    """Replay history to the terminal in the same shapes as a live turn."""
+    history = agent.history
+    shown = history if limit is None else history[-limit:]
+    hidden = len(history) - len(shown)
+    if hidden > 0:
+        ui.info(f"… {hidden} earlier messages not shown (/history all for everything)")
+    for message in shown:
+        role = message.get("role")
+        content = (message.get("content") or "").strip()
+        if role == "user":
+            # Harness-authored messages are context, not something you typed.
+            if content.startswith(("[harness]", "<state>", context.SUMMARY_HEADER)):
+                ui.info(f"  {content.splitlines()[0][:100]}")
+            else:
+                print(ui.cyan("> ") + content)
+        elif role == "assistant":
+            if content:
+                ui.assistant_prefix()
+                print(markdown.render(content, style=ui.colors_enabled()))
+            for call in message.get("tool_calls") or []:
+                fn = call.get("function", {})
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = {"raw_arguments": fn.get("arguments", "")}
+                ui.tool_call(fn.get("name", "?"), args if isinstance(args, dict) else {})
+        elif role == "tool":
+            ui.tool_result(content, is_error=content.startswith("ERROR"))
+
+
+def restore(agent: Agent) -> dict:
+    """Load an earlier session's conversation into the agent. Prints nothing."""
     cfg = agent.cfg
     history, stats = sessions.load_history(
         cfg.log_path, cfg.max_output_chars, cfg.max_output_lines
@@ -300,8 +345,13 @@ def restore(agent: Agent) -> None:
         tokens=agent.used_tokens(),
         **stats,
     )
+    return stats
+
+
+def report_resume(agent: Agent, stats: dict, transcript: bool = True) -> None:
+    """Say what was loaded, and show it. Called after the banner."""
     ui.info(
-        f"resumed {cfg.log_path.stem}: {len(agent.history)} messages, "
+        f"resumed {agent.cfg.log_path.stem}: {len(agent.history)} messages, "
         f"~{agent.used_tokens()} tokens"
         + (
             f", {stats['compactions_applied']} compactions replayed"
@@ -309,6 +359,8 @@ def restore(agent: Agent) -> None:
             else ""
         )
     )
+    if transcript and agent.history:
+        print_transcript(agent)
 
 
 def main() -> int:
@@ -323,8 +375,7 @@ def main() -> int:
     log = Logbook(cfg.log_path)
     log.session_start(cfg, resumed=cfg.resumed)
     agent = Agent(cfg, log)
-    if cfg.resumed:
-        restore(agent)
+    resume_stats = restore(agent) if cfg.resumed else None
 
     # One-shot: -p flag, or a message piped on stdin.
     oneshot = args.prompt
@@ -332,6 +383,8 @@ def main() -> int:
         piped = sys.stdin.read().strip()
         oneshot = piped or None
     if oneshot:
+        if resume_stats is not None:
+            report_resume(agent, resume_stats, transcript=False)
         run_turn(agent, oneshot)
         log.event("session_end", mode="oneshot", interrupted=agent.interrupted)
         return 130 if agent.interrupted else 0  # 130 = terminated by SIGINT
@@ -351,6 +404,8 @@ def main() -> int:
         + (f"compact at {cfg.compact_threshold}" if cfg.compact else "compaction off")
     )
     ui.info(f"log {cfg.log_path}")
+    if resume_stats is not None:
+        report_resume(agent, resume_stats)
 
     prefix = ""  # text typed without Enter while the agent was working
     while True:
