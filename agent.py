@@ -14,6 +14,7 @@ from config import Config
 from context import INTERRUPT_NOTE, SUMMARY_FALLBACK, step_limit_note
 from llm import LLM
 from logbook import Logbook
+from session import Session
 from util import ToolError, ToolInterrupted, truncate
 
 
@@ -81,9 +82,12 @@ class Agent:
     def __init__(self, cfg: Config, log: Logbook) -> None:
         self.cfg = cfg
         self.log = log
-        self.llm = LLM(cfg, log)
+        self.llm = LLM(cfg, log, notify=ui.warn)
         self.history: list[dict[str, Any]] = []
         self.last_usage: dict[str, Any] | None = None
+        self.session = Session(cfg.workspace)
+        # The harness's own credentials are of no use to the model.
+        self.redactor = cfg.redactor()
         self.meter = context.TokenMeter(toolkit.TOOL_SCHEMAS)
         self.compactions = 0
         self.interrupted = False
@@ -94,8 +98,8 @@ class Agent:
     def model_changed(self) -> None:
         """Forget tokenizer calibration and let dropped parameters be retried."""
         self.meter = context.TokenMeter(toolkit.TOOL_SCHEMAS)
-        self.llm._supports_effort = True
-        self.llm._supports_extra_body = True
+        self.llm.supports_effort = True
+        self.llm.supports_extra_body = True
 
     def attach_log(self, log: Logbook) -> None:
         """Point the agent and its client at another session's log."""
@@ -143,7 +147,7 @@ class Agent:
             *self.history,
             # Role "user", not "system": Gemma-style templates have no system role,
             # so a trailing system message can be dropped by the server's template.
-            {"role": "user", "content": self.cfg.state_block()},
+            {"role": "user", "content": self.session.state_block()},
         ]
 
     def _printer(self) -> _Printer:
@@ -368,6 +372,7 @@ class Agent:
                 self.note_interrupt("stream")
                 return final_text
 
+            self.session.add_usage(reply.usage, reply.reasoning_tokens)
             if reply.usage:
                 self.last_usage = reply.usage
                 self.meter.calibrate(sent_chars, reply.usage.get("prompt_tokens"))
@@ -422,7 +427,7 @@ class Agent:
             )
             started = time.monotonic()
             try:
-                result, is_error = toolkit.execute(name, args, self.cfg), False
+                result, is_error = toolkit.execute(name, args, self.cfg, self.session), False
             except ToolError as exc:
                 result, is_error = f"ERROR: {exc}", True
             except ToolInterrupted as exc:
@@ -442,6 +447,7 @@ class Agent:
             )
             elapsed = 0.0
 
+        result = self.redactor.scrub_output(result)
         clamped, note = truncate(
             result, self.cfg.max_output_chars, self.cfg.max_output_lines
         )

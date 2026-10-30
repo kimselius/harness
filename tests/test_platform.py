@@ -16,21 +16,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tests"))
+
+import common  # noqa: E402
+from common import check  # noqa: E402
 
 import steer  # noqa: E402
 import tools as toolkit  # noqa: E402
 import ui  # noqa: E402
-from config import build_parser, config_from_args  # noqa: E402
-
-failures: list[str] = []
-
-
-def check(label: str, condition: bool, detail: str = "") -> None:
-    if condition:
-        print(f"  ok   {label}")
-    else:
-        failures.append(label)
-        print(f"  FAIL {label} {detail}")
+from session import Session  # noqa: E402
 
 
 def test_kill_without_process_groups() -> None:
@@ -102,11 +96,8 @@ def test_kill_without_sigkill() -> None:
 def test_probe_is_posix_only(tmp: Path) -> None:
     print("cwd probe is not appended off POSIX")
     os.environ.setdefault("OPENAI_API_KEY", "x")
-    cfg = config_from_args(
-        build_parser().parse_args(
-            ["--workspace", str(tmp / "ws"), "--log-dir", str(tmp / "logs")]
-        )
-    )
+    cfg = common.make_config(tmp)
+    session = Session(cfg.workspace)
     check("probe present on this platform", bool(toolkit.CWD_PROBE) is toolkit.POSIX_SHELL)
 
     # Simulate the Windows build of the module: no probe appended at all.
@@ -114,11 +105,12 @@ def test_probe_is_posix_only(tmp: Path) -> None:
     toolkit.CWD_PROBE = ""
     try:
         (cfg.workspace / "sub").mkdir(exist_ok=True)
-        result = toolkit.tool_shell({"command": "cd sub"}, cfg)
+        result = toolkit.tool_shell({"command": "cd sub"}, cfg, session)
         check("command still runs", "exit code: 0" in result, result.splitlines()[0])
         check("no marker leaks", toolkit.CWD_MARKER not in result)
-        check("directory simply stays put", cfg.cwd == cfg.workspace, str(cfg.cwd))
-        out = toolkit.tool_shell({"command": "echo hello"}, cfg)
+        check("directory simply stays put", session.cwd == session.root,
+              str(session.cwd))
+        out = toolkit.tool_shell({"command": "echo hello"}, cfg, session)
         check("output still captured", "hello" in out, out)
     finally:
         toolkit.CWD_PROBE = saved
@@ -155,12 +147,7 @@ def main_() -> int:
         test_probe_is_posix_only(tmp)
         test_queue_survives_unwatchable_stdin()
         test_colour_detection()
-    print()
-    if failures:
-        print(f"{len(failures)} failed: {', '.join(failures)}")
-        return 1
-    print("all checks passed")
-    return 0
+    return common.report()
 
 
 if __name__ == "__main__":

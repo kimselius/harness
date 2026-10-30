@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import io
 import json
-import os
 import sys
 import tempfile
 from contextlib import redirect_stdout
@@ -14,48 +13,21 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
+import common  # noqa: E402
 import mock_server  # noqa: E402
+from common import check, records  # noqa: E402
 
 import llm as llm_mod  # noqa: E402
 from agent import Agent, _Printer  # noqa: E402
-from config import build_parser, config_from_args  # noqa: E402
-from logbook import Logbook  # noqa: E402
 
-failures: list[str] = []
 THOUGHT = "Let me work through this carefully, step by step, before answering."
 
 
-def check(label: str, condition: bool, detail: str = "") -> None:
-    if condition:
-        print(f"  ok   {label}")
-    else:
-        failures.append(label)
-        print(f"  FAIL {label} {detail}")
-
-
 def make_agent(tmp: Path, base_url: str, extra: list[str] | None = None) -> Agent:
-    os.environ.setdefault("OPENAI_API_KEY", "x")
-    cfg = config_from_args(
-        build_parser().parse_args(
-            [
-                "--model", "mock",
-                "--base-url", base_url,
-                "--workspace", str(tmp / "ws"),
-                "--log-dir", str(tmp / "logs"),
-                "--prompt-file", str(tmp / "nope.md"),
-                *(extra or []),
-            ]
-        )
+    """Streaming stays on unless the caller passes --no-stream, as before."""
+    return common.make_agent(
+        tmp, base_url, extra, stream="--no-stream" not in (extra or [])
     )
-    return Agent(cfg, Logbook(cfg.log_path))
-
-
-def records(agent: Agent) -> list[dict]:
-    return [
-        json.loads(line)
-        for line in agent.cfg.log_path.read_text().splitlines()
-        if line.strip()
-    ]
 
 
 def test_token_parsing() -> None:
@@ -250,7 +222,7 @@ def test_unrelated_400_is_not_blamed_on_parameters(tmp: Path, base_url: str) -> 
     check("the real error surfaces", raised is not None, "no exception")
     check("not blamed on reasoning_effort", "rejected" not in out.getvalue(),
           out.getvalue()[:160])
-    check("effort still enabled for later calls", agent.llm._supports_effort)
+    check("effort still enabled for later calls", agent.llm.supports_effort)
     check("logged as an llm_error",
           any(r["type"] == "llm_error" for r in records(agent)))
     mock_server.reset()
@@ -263,11 +235,11 @@ def test_model_change_resets_calibration(tmp: Path, base_url: str) -> None:
     agent = make_agent(tmp / "switch", base_url, ["--no-stream"])
     agent.meter.calibrate(agent.meter.request_chars([{"role": "user", "content": "x" * 400}]), 100)
     check("calibrated", agent.meter.samples == 1)
-    agent.llm._supports_effort = False
+    agent.llm.supports_effort = False
     agent.model_changed()
     check("calibration forgotten", agent.meter.samples == 0)
     check("tool schemas still counted", agent.meter.tools_chars > 500)
-    check("dropped parameters get another chance", agent.llm._supports_effort)
+    check("dropped parameters get another chance", agent.llm.supports_effort)
 
 
 def test_printer_interleaving() -> None:
@@ -310,12 +282,7 @@ def main_() -> int:
         test_model_change_resets_calibration(tmp, base_url)
         test_printer_interleaving()
     server.shutdown()
-    print()
-    if failures:
-        print(f"{len(failures)} failed: {', '.join(failures)}")
-        return 1
-    print("all checks passed")
-    return 0
+    return common.report()
 
 
 if __name__ == "__main__":

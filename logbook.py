@@ -25,10 +25,13 @@ def _clip(value: Any) -> Any:
 
 
 class Logbook:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, scrub: Any = None) -> None:
         self.path = path
+        # Transcripts hold full file contents and command output, so they are
+        # private by default: 0700 on the directory, 0600 on the file.
+        self.scrub = scrub or (lambda value: value)
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         except OSError as exc:
             raise SystemExit(
                 f"Cannot create log directory {self.path.parent}: {exc.strerror}. "
@@ -48,9 +51,15 @@ class Logbook:
             "type": kind,
             **_clip(fields),
         }
-        line = json.dumps(record, ensure_ascii=False, default=str)
+        line = json.dumps(self.scrub(record), ensure_ascii=False, default=str)
+        existed = self.path.exists()
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
+        if not existed:
+            try:
+                os.chmod(self.path, 0o600)
+            except OSError:
+                pass
 
     def session_start(self, cfg: Any, resumed: bool = False) -> None:
         self.event(

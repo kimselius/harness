@@ -6,6 +6,8 @@ from __future__ import annotations
 import atexit
 import json
 import sys
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import context
@@ -34,104 +36,7 @@ def history_file(cfg: Config) -> Path:
     """
     return cfg.log_path.parent / ".harness_history"
 
-# One list, so /help and tab completion cannot drift apart.
-COMMANDS: list[tuple[str, str, str]] = [
-    ("help", "", "this list"),
-    ("tools", "", "list available tools"),
-    ("model", "[name]", "show or switch model"),
-    ("prompt", "", "show the active system prompt"),
-    ("history", "[n|all]", "replay the conversation (default: last 12 messages)"),
-    ("cwd", "[dir]", "show or set the shell's working directory"),
-    ("context", "", "token usage vs the context window"),
-    ("compact", "", "summarize history now"),
-    ("think", "[level]", "show or set reasoning_effort (high, low, off, ...)"),
-    ("limits", "", "current output/timeout limits and reasoning settings"),
-    ("reset", "", "clear conversation history"),
-    ("log", "", "path to the JSONL session log"),
-    ("sessions", "", "list recorded sessions"),
-    ("resume", "<id>", "load an earlier session (id, prefix, or \"last\")"),
-    ("exit", "", "leave (also /quit, /q, or Ctrl-D)"),
-]
-COMMAND_NAMES = [name for name, _, _ in COMMANDS]
-
-THINK_LEVELS = ["minimal", "low", "medium", "high", "off"]
-
-HELP = (
-    "commands\n"
-    + "".join(
-        f"  /{name + (' ' + args if args else ''):<18} {description}\n"
-        for name, args, description in COMMANDS
-    )
-    + """input
-  type while busy    messages are queued and picked up at the next step
-  paste              multi-line pastes are kept together as one message
-  <<<                type a multi-line message, end with a line containing >>>
-  Tab                complete command names and their arguments
-  Ctrl-C             interrupt the running turn (kills any running command)
-"""
-)
-
-
-def completions(buffer: str, text: str, agent: Agent) -> list[str]:
-    """Tab completions for the current line. Only commands, never prose."""
-    line = buffer.lstrip()
-    if not line.startswith("/"):
-        return []
-    head, space, _ = line.partition(" ")
-    if not space:  # still typing the command itself
-        prefix = head[1:].lower()
-        return [f"/{name}" for name in COMMAND_NAMES if name.startswith(prefix)]
-
-    cmd = head[1:].lower()
-    options: list[str] = []
-    if cmd == "think":
-        options = THINK_LEVELS
-    elif cmd == "history":
-        options = ["all"]
-    elif cmd == "resume":
-        options = ["last"] + [
-            path.stem for path in sessions.session_files(agent.cfg.log_path.parent)
-        ]
-    elif cmd == "cwd":
-        root = agent.cfg.workspace
-        options = sorted(
-            str(path.relative_to(root))
-            for path in root.rglob("*")
-            if path.is_dir() and not path.name.startswith(".")
-        )[:200]
-    elif cmd == "model":
-        options = [agent.cfg.model]
-    return [option for option in options if option.startswith(text)]
-
-
-def setup_completion(agent: Agent) -> bool:
-    """Bind Tab to the command completer. False if readline cannot do it."""
-    try:
-        import readline
-    except ImportError:
-        return False
-
-    def complete(text: str, state: int):
-        try:
-            matches = completions(readline.get_line_buffer(), text, agent)
-        except Exception:
-            return None  # never let completion break the prompt
-        return matches[state] if state < len(matches) else None
-
-    readline.set_completer(complete)
-    # Keep "/" and "-" out of the delimiters so whole commands and session ids
-    # are offered as single words.
-    readline.set_completer_delims(" \t\n")
-    try:
-        if getattr(readline, "backend", "") == "editline":
-            readline.parse_and_bind("bind ^I rl_complete")  # libedit syntax
-        else:
-            readline.parse_and_bind("tab: complete")
-    except Exception:
-        return False
-    return True
-
-
+# --- terminal input --------------------------------------------------------
 def setup_readline(path: Path) -> None:
     try:
         import readline
@@ -215,113 +120,281 @@ def read_multiline() -> str:
     return "\n".join(lines)
 
 
-def handle_command(line: str, agent: Agent) -> bool:
-    """Returns True if the loop should continue, False to exit."""
-    cmd, _, rest = line[1:].strip().partition(" ")
-    cmd = cmd.lower()
-    cfg = agent.cfg
 
-    if cmd in ("exit", "quit", "q"):
-        return False
-    if cmd in ("help", "h", "?"):
-        print(HELP, end="")
-    elif cmd == "tools":
-        for schema in toolkit.TOOL_SCHEMAS:
-            fn = schema["function"]
-            params = ", ".join(fn["parameters"]["properties"])
-            print(f"  {ui.bold(fn['name']):<24} {ui.dim(params)}")
-    elif cmd == "model":
-        if rest.strip():
-            cfg.model = rest.strip()
-            agent.model_changed()
-            agent.log.event("model_changed", model=cfg.model)
-        ui.info(f"model: {cfg.model}  base_url: {cfg.base_url or 'api.openai.com'}")
-    elif cmd == "prompt":
-        ui.info(f"source: {cfg.prompt_source}")
-        print(cfg.system_prompt())
-    elif cmd == "history":
-        ui.info(f"{len(agent.history)} messages in context")
-        if agent.history:
-            argument = rest.strip().lower()
-            if argument in ("all", "full"):
-                print_transcript(agent, limit=None)
-            elif argument.isdigit():
-                print_transcript(agent, limit=max(1, int(argument)))
-            else:
-                print_transcript(agent)
-    elif cmd == "context":
-        used = agent.used_tokens()
-        pct = 100 * used / cfg.context_tokens
-        measured = agent.meter.last_prompt_tokens
-        ui.info(
-            f"~{used} / {cfg.context_tokens} tokens ({pct:.0f}%) · "
-            f"{len(agent.history)} messages · {agent.compactions} compactions"
-        )
-        ui.info(
-            f"compact at {cfg.compact_threshold if cfg.compact else 'disabled'} · "
-            f"keep {cfg.compact_keep_tokens} · "
-            f"{agent.meter.chars_per_token:.2f} chars/token"
-            + (f" (calibrated, last prompt {measured} tokens)" if measured else " (estimate)")
-        )
-    elif cmd == "compact":
-        if not agent.compact(reason="manual"):
-            ui.info("nothing to compact yet")
-    elif cmd == "reset":
-        agent.reset()
-        ui.info("history cleared")
-    elif cmd == "cwd":
-        if rest.strip():
-            target = (cfg.workspace / rest.strip()).resolve()
-            if not target.is_dir():
-                ui.warn(f"no such directory: {rest.strip()}")
-            else:
-                if not cfg.set_cwd(target):
-                    ui.warn("outside the workspace, reset to the root")
-                agent.log.event("cwd_set", cwd=str(cfg.cwd))
-        ui.info(f"{cfg.cwd}  (workspace root: {cfg.workspace})")
-    elif cmd == "log":
-        ui.info(f"{cfg.log_path}  (session {agent.log.session_id})")
-    elif cmd == "sessions":
-        list_sessions(cfg.log_path.parent)
-    elif cmd == "resume":
-        if not rest.strip():
-            ui.warn("usage: /resume <session-id|last>")
-        else:
-            try:
-                path = sessions.resolve(cfg.log_path.parent, rest.strip())
-            except sessions.SessionError as exc:
-                ui.warn(str(exc))
-                return True
-            if path == cfg.log_path:
-                ui.info("already in that session")
-                return True
-            agent.attach_log(Logbook(path))
-            cfg.log_path = path
-            agent.log.session_start(cfg, resumed=True)
-            report_resume(agent, restore(agent))
-    elif cmd == "limits":
-        ui.info(
-            f"output: {cfg.max_output_chars} chars / {cfg.max_output_lines} lines · "
-            f"shell timeout: {cfg.shell_timeout:g}s (max {cfg.max_shell_timeout:g}s) · "
-            f"max steps: {cfg.max_steps}"
-        )
-        ui.info(
-            f"reasoning_effort: {cfg.reasoning_effort or 'off (model default)'} · "
-            f"show thinking: {'yes' if cfg.show_thinking else 'no'}"
-            + (f" · extra body: {cfg.extra_body}" if cfg.extra_body else "")
-        )
-    elif cmd == "think":
-        if rest.strip():
-            cfg.reasoning_effort = normalize_effort(rest)
-            agent.log.event("reasoning_effort_changed", value=cfg.reasoning_effort)
-            agent.llm._supports_effort = True  # a new value gets a fresh chance
-        ui.info(
-            f"reasoning_effort: {cfg.reasoning_effort or 'off (model default)'}"
-            + ("" if rest.strip() else "   (/think high, /think off)")
-        )
+# --- commands --------------------------------------------------------------
+# One table per command: help text, handler and argument completions together.
+# Adding a command means adding one entry here and nothing else.
+
+
+@dataclass(frozen=True)
+class Command:
+    name: str
+    args: str  # argument hint shown in /help
+    help: str
+    run: Callable[[Agent, str], object]  # return False to leave the REPL
+    complete: Callable[[Agent], list[str]] | None = None
+    aliases: tuple[str, ...] = ()
+
+
+THINK_LEVELS = ["minimal", "low", "medium", "high", "off"]
+
+
+def cmd_help(agent: Agent, rest: str) -> None:
+    print(HELP, end="")
+
+
+def cmd_tools(agent: Agent, rest: str) -> None:
+    for tool in toolkit.TOOLS:
+        params = ", ".join(tool.schema["function"]["parameters"]["properties"])
+        print(f"  {ui.bold(tool.name):<24} {ui.dim(params)}")
+
+
+def cmd_model(agent: Agent, rest: str) -> None:
+    cfg = agent.cfg
+    if rest.strip():
+        cfg.model = rest.strip()
+        agent.model_changed()  # a new tokenizer invalidates the calibration
+        agent.log.event("model_changed", model=cfg.model)
+    ui.info(f"model: {cfg.model}  base_url: {cfg.base_url or 'api.openai.com'}")
+
+
+def cmd_prompt(agent: Agent, rest: str) -> None:
+    ui.info(f"source: {agent.cfg.prompt_source}")
+    print(agent.cfg.system_prompt())
+
+
+def cmd_history(agent: Agent, rest: str) -> None:
+    ui.info(f"{len(agent.history)} messages in context")
+    if not agent.history:
+        return
+    argument = rest.strip().lower()
+    if argument in ("all", "full"):
+        print_transcript(agent, limit=None)
+    elif argument.isdigit():
+        print_transcript(agent, limit=max(1, int(argument)))
     else:
-        ui.warn(f"unknown command /{cmd} — try /help")
+        print_transcript(agent)
+
+
+def cmd_cwd(agent: Agent, rest: str) -> None:
+    cfg, session = agent.cfg, agent.session
+    if rest.strip():
+        target = (session.root / rest.strip()).resolve()
+        if not target.is_dir():
+            ui.warn(f"no such directory: {rest.strip()}")
+        else:
+            if not session.set_cwd(target):
+                ui.warn("outside the workspace, reset to the root")
+            agent.log.event("cwd_set", cwd=str(session.cwd))
+    ui.info(f"{session.cwd}  (workspace root: {cfg.workspace})")
+
+
+def complete_cwd(agent: Agent) -> list[str]:
+    root = agent.session.root
+    return sorted(
+        str(path.relative_to(root))
+        for path in root.rglob("*")
+        if path.is_dir() and not path.name.startswith(".")
+    )[:200]
+
+
+def cmd_context(agent: Agent, rest: str) -> None:
+    cfg = agent.cfg
+    used = agent.used_tokens()
+    measured = agent.meter.last_prompt_tokens
+    ui.info(
+        f"~{used} / {cfg.context_tokens} tokens "
+        f"({100 * used / cfg.context_tokens:.0f}%) · "
+        f"{len(agent.history)} messages · {agent.compactions} compactions"
+    )
+    ui.info(
+        f"compact at {cfg.compact_threshold if cfg.compact else 'disabled'} · "
+        f"keep {cfg.compact_keep_tokens} · "
+        f"{agent.meter.chars_per_token:.2f} chars/token"
+        + (
+            f" (calibrated, last prompt {measured} tokens)"
+            if measured
+            else " (estimate)"
+        )
+    )
+    ui.info(f"session total: {agent.session.totals_line()}")
+
+
+def cmd_compact(agent: Agent, rest: str) -> None:
+    if not agent.compact(reason="manual"):
+        ui.info("nothing to compact yet")
+
+
+def cmd_think(agent: Agent, rest: str) -> None:
+    cfg = agent.cfg
+    if rest.strip():
+        cfg.reasoning_effort = normalize_effort(rest)
+        agent.log.event("reasoning_effort_changed", value=cfg.reasoning_effort)
+        agent.llm.supports_effort = True  # a new value gets a fresh chance
+    ui.info(
+        f"reasoning_effort: {cfg.reasoning_effort or 'off (model default)'}"
+        + ("" if rest.strip() else "   (/think high, /think off)")
+    )
+
+
+def cmd_limits(agent: Agent, rest: str) -> None:
+    cfg = agent.cfg
+    ui.info(
+        f"output: {cfg.max_output_chars} chars / {cfg.max_output_lines} lines · "
+        f"shell timeout: {cfg.shell_timeout:g}s (max {cfg.max_shell_timeout:g}s) · "
+        f"max steps: {cfg.max_steps}"
+    )
+    ui.info(
+        f"reasoning_effort: {cfg.reasoning_effort or 'off (model default)'} · "
+        f"show thinking: {'yes' if cfg.show_thinking else 'no'}"
+        + (f" · extra body: {cfg.extra_body}" if cfg.extra_body else "")
+    )
+
+
+def cmd_reset(agent: Agent, rest: str) -> None:
+    agent.reset()
+    ui.info("history cleared")
+
+
+def cmd_log(agent: Agent, rest: str) -> None:
+    ui.info(f"{agent.cfg.log_path}  (session {agent.log.session_id})")
+
+
+def cmd_sessions(agent: Agent, rest: str) -> None:
+    list_sessions(agent.cfg.log_path.parent)
+
+
+def cmd_resume(agent: Agent, rest: str) -> None:
+    cfg = agent.cfg
+    if not rest.strip():
+        ui.warn("usage: /resume <session-id|last>")
+        return
+    try:
+        path = sessions.resolve(cfg.log_path.parent, rest.strip())
+    except sessions.SessionError as exc:
+        ui.warn(str(exc))
+        return
+    if path == cfg.log_path:
+        ui.info("already in that session")
+        return
+    agent.attach_log(Logbook(path, scrub=cfg.redactor().scrub_log))
+    cfg.log_path = path
+    agent.log.session_start(cfg, resumed=True)
+    report_resume(agent, restore(agent))
+
+
+def complete_resume(agent: Agent) -> list[str]:
+    return ["last"] + [
+        path.stem for path in sessions.session_files(agent.cfg.log_path.parent)
+    ]
+
+
+def cmd_exit(agent: Agent, rest: str) -> bool:
+    return False
+
+
+COMMANDS: list[Command] = [
+    Command("help", "", "this list", cmd_help, aliases=("h", "?")),
+    Command("tools", "", "list available tools", cmd_tools),
+    Command("model", "[name]", "show or switch model", cmd_model,
+            lambda agent: [agent.cfg.model]),
+    Command("prompt", "", "show the active system prompt", cmd_prompt),
+    Command("history", "[n|all]",
+            "replay the conversation (default: last 12 messages)", cmd_history,
+            lambda agent: ["all"]),
+    Command("cwd", "[dir]", "show or set the shell's working directory", cmd_cwd,
+            complete_cwd),
+    Command("context", "", "token usage vs the context window", cmd_context),
+    Command("compact", "", "summarize history now", cmd_compact),
+    Command("think", "[level]", "show or set reasoning_effort (high, low, off, ...)",
+            cmd_think, lambda agent: THINK_LEVELS),
+    Command("limits", "", "current output/timeout limits and reasoning settings",
+            cmd_limits),
+    Command("reset", "", "clear conversation history", cmd_reset),
+    Command("log", "", "path to the JSONL session log", cmd_log),
+    Command("sessions", "", "list recorded sessions", cmd_sessions),
+    Command("resume", "<id>", 'load an earlier session (id, prefix, or "last")',
+            cmd_resume, complete_resume),
+    Command("exit", "", "leave (also /quit, /q, or Ctrl-D)", cmd_exit,
+            aliases=("quit", "q")),
+]
+
+BY_NAME: dict[str, Command] = {
+    alias: command
+    for command in COMMANDS
+    for alias in (command.name, *command.aliases)
+}
+
+HELP = (
+    "commands\n"
+    + "".join(
+        f"  /{command.name + (' ' + command.args if command.args else ''):<18} "
+        f"{command.help}\n"
+        for command in COMMANDS
+    )
+    + """input
+  type while busy    messages are queued and picked up at the next step
+  paste              multi-line pastes are kept together as one message
+  <<<                type a multi-line message, end with a line containing >>>
+  Tab                complete command names and their arguments
+  Ctrl-C             interrupt the running turn (kills any running command)
+"""
+)
+
+
+def completions(buffer: str, text: str, agent: Agent) -> list[str]:
+    """Tab completions for the current line. Only commands, never prose."""
+    line = buffer.lstrip()
+    if not line.startswith("/"):
+        return []
+    head, space, _ = line.partition(" ")
+    if not space:  # still typing the command itself
+        prefix = head[1:].lower()
+        return [f"/{command.name}" for command in COMMANDS
+                if command.name.startswith(prefix)]
+
+    command = BY_NAME.get(head[1:].lower())
+    if command is None or command.complete is None:
+        return []
+    return [option for option in command.complete(agent) if option.startswith(text)]
+
+
+def setup_completion(agent: Agent) -> bool:
+    """Bind Tab to the command completer. False if readline cannot do it."""
+    try:
+        import readline
+    except ImportError:
+        return False
+
+    def complete(text: str, state: int):
+        try:
+            matches = completions(readline.get_line_buffer(), text, agent)
+        except Exception:
+            return None  # never let completion break the prompt
+        return matches[state] if state < len(matches) else None
+
+    readline.set_completer(complete)
+    # Keep "/" and "-" out of the delimiters so whole commands and session ids
+    # are offered as single words.
+    readline.set_completer_delims(" \t\n")
+    try:
+        if getattr(readline, "backend", "") == "editline":
+            readline.parse_and_bind("bind ^I rl_complete")  # libedit syntax
+        else:
+            readline.parse_and_bind("tab: complete")
+    except Exception:
+        return False
     return True
+
+
+def handle_command(line: str, agent: Agent) -> bool:
+    """Run a slash command. Returns False when the REPL should exit."""
+    name, _, rest = line[1:].strip().partition(" ")
+    command = BY_NAME.get(name.lower())
+    if command is None:
+        ui.warn(f"unknown command /{name} — try /help")
+        return True
+    return command.run(agent, rest) is not False
 
 
 def run_turn(agent: Agent, message: str) -> None:
@@ -444,7 +517,7 @@ def main() -> int:
         list_sessions(anchor(args.log_dir))
         return 0
     cfg = config_from_args(args)
-    log = Logbook(cfg.log_path)
+    log = Logbook(cfg.log_path, scrub=cfg.redactor().scrub_log)
     log.session_start(cfg, resumed=cfg.resumed)
     agent = Agent(cfg, log)
     resume_stats = restore(agent) if cfg.resumed else None
@@ -458,7 +531,8 @@ def main() -> int:
         if resume_stats is not None:
             report_resume(agent, resume_stats, transcript=False)
         run_turn(agent, oneshot)
-        log.event("session_end", mode="oneshot", interrupted=agent.interrupted)
+        log.event("session_end", mode="oneshot", interrupted=agent.interrupted,
+                  **agent.session.totals())
         return 130 if agent.interrupted else 0  # 130 = terminated by SIGINT
 
     setup_readline(history_file(cfg))
@@ -485,7 +559,8 @@ def main() -> int:
         try:
             # Show the shell's directory when it is not the workspace root, so
             # the state the model sees is visible to you as well.
-            where = "" if cfg.cwd == cfg.workspace else ui.dim(f"{cfg.cwd_label} ")
+            where = ("" if agent.session.cwd == agent.session.root
+                     else ui.dim(f"{agent.session.cwd_label} "))
             line = prefix + read_message(ui.input_prompt(where + ui.cyan("> ")))
             prefix = ""
         except EOFError:
@@ -517,7 +592,9 @@ def main() -> int:
         if agent.inbox:
             prefix = agent.inbox.take_leftover()
 
-    log.event("session_end", mode="interactive", messages=len(agent.history))
+    log.event("session_end", mode="interactive", messages=len(agent.history),
+              **agent.session.totals())
+    ui.info(f"session total: {agent.session.totals_line()}")
     ui.info("bye")
     return 0
 

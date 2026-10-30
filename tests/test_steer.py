@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import pty
-import select
-import subprocess
 import sys
 import tempfile
 import time
@@ -16,42 +13,13 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
+import common  # noqa: E402
 import mock_server  # noqa: E402
-
 import ptyrun  # noqa: E402
+from common import check, make_agent, real_users  # noqa: E402
+
 import steer  # noqa: E402
-from agent import Agent  # noqa: E402
-from config import build_parser, config_from_args  # noqa: E402
 from llm import Reply  # noqa: E402
-from logbook import Logbook  # noqa: E402
-
-failures: list[str] = []
-
-
-def check(label: str, condition: bool, detail: str = "") -> None:
-    if condition:
-        print(f"  ok   {label}")
-    else:
-        failures.append(label)
-        print(f"  FAIL {label} {detail}")
-
-
-def make_agent(tmp: Path, base_url: str, extra: list[str] | None = None) -> Agent:
-    os.environ.setdefault("OPENAI_API_KEY", "x")
-    cfg = config_from_args(
-        build_parser().parse_args(
-            [
-                "--model", "mock",
-                "--base-url", base_url,
-                "--workspace", str(tmp / "ws"),
-                "--log-dir", str(tmp / "logs"),
-                "--prompt-file", str(tmp / "nope.md"),
-                "--no-stream",
-                *(extra or []),
-            ]
-        )
-    )
-    return Agent(cfg, Logbook(cfg.log_path))
 
 
 def test_queue_reads_lines() -> None:
@@ -97,12 +65,6 @@ def test_queue_reads_lines() -> None:
     os.close(write_fd)
 
 
-def real_users(messages: list[dict]) -> list[str]:
-    """User messages, minus the harness state block appended to every request."""
-    return [
-        m["content"] for m in messages
-        if m["role"] == "user" and not m["content"].startswith("<state>")
-    ]
 
 
 class FakeInbox:
@@ -229,12 +191,7 @@ def main_() -> int:
         test_typing_while_a_tool_runs(tmp, base_url)
         test_typed_after_turn_runs_next(tmp, base_url)
     server.shutdown()
-    print()
-    if failures:
-        print(f"{len(failures)} failed: {', '.join(failures)}")
-        return 1
-    print("all checks passed")
-    return 0
+    return common.report()
 
 
 if __name__ == "__main__":

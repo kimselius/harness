@@ -6,7 +6,6 @@ from typing import Any
 
 from openai import BadRequestError, OpenAI
 
-import ui
 from config import Config
 from logbook import Logbook
 
@@ -91,18 +90,21 @@ class Reply:
 
 
 class LLM:
-    def __init__(self, cfg: Config, log: Logbook) -> None:
+    def __init__(self, cfg: Config, log: Logbook, notify: Any = None) -> None:
         self.cfg = cfg
         self.log = log
+        # How to tell the user something, without this layer knowing about the
+        # terminal. Defaults to silence so library use stays quiet.
+        self.notify = notify or (lambda message: None)
         self.client = OpenAI(
             api_key=cfg.api_key,
             base_url=cfg.base_url,
             timeout=cfg.request_timeout,
             max_retries=3,
         )
-        self._supports_stream_usage = True
-        self._supports_effort = True
-        self._supports_extra_body = True
+        self.supports_stream_usage = True
+        self.supports_effort = True
+        self.supports_extra_body = True
 
     def _params(
         self,
@@ -123,9 +125,9 @@ class LLM:
             params["max_tokens"] = self.cfg.max_tokens
 
         chosen = self.cfg.reasoning_effort if effort == INHERIT else effort
-        if chosen and self._supports_effort:
+        if chosen and self.supports_effort:
             params["reasoning_effort"] = chosen
-        if self.cfg.extra_body and self._supports_extra_body:
+        if self.cfg.extra_body and self.supports_extra_body:
             # Must go through the SDK's extra_body: create() is typed and rejects
             # unknown keyword arguments outright.
             params["extra_body"] = dict(self.cfg.extra_body)
@@ -153,16 +155,18 @@ class LLM:
         dropped = []
         if "reasoning_effort" in blamed:
             params.pop("reasoning_effort", None)
-            self._supports_effort = False
+            self.supports_effort = False
             dropped.append("reasoning_effort")
         if any(key in blamed for key in (self.cfg.extra_body or {})):
             params.pop("extra_body", None)
-            self._supports_extra_body = False
+            self.supports_extra_body = False
             dropped.extend(sorted(self.cfg.extra_body or {}))
         if not dropped:
             return None
         self.log.event("params_dropped", fields=dropped, reason=str(error)[:200])
-        ui.warn(f"! this endpoint rejected {', '.join(dropped)}; continuing without")
+        self.notify(
+            f"! this endpoint rejected {', '.join(dropped)}; continuing without"
+        )
         return params
 
     def complete(
@@ -249,15 +253,15 @@ class LLM:
 
     def _stream(self, params: dict, on_text: Any, on_reasoning: Any = None) -> Reply:
         kwargs = dict(params, stream=True)
-        if self._supports_stream_usage:
+        if self.supports_stream_usage:
             kwargs["stream_options"] = {"include_usage": True}
         try:
             stream = self.client.chat.completions.create(**kwargs)
         except Exception:
-            if not self._supports_stream_usage:
+            if not self.supports_stream_usage:
                 raise
             # Some compatible servers reject stream_options; retry without it once.
-            self._supports_stream_usage = False
+            self.supports_stream_usage = False
             kwargs.pop("stream_options", None)
             stream = self.client.chat.completions.create(**kwargs)
 

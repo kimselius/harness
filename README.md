@@ -170,7 +170,7 @@ Worth knowing:
 | `/prompt` | print the active system prompt |
 | `/history [n\|all]` | replay the conversation (default: last 12 messages) |
 | `/cwd [dir]` | show or set the shell's working directory |
-| `/context` | token usage vs the window, plus the calibrated chars/token |
+| `/context` | token usage vs the window, the calibrated chars/token, and session totals |
 | `/compact` | summarize history now |
 | `/reset` | clear conversation history |
 | `/log` | path to this session's JSONL log |
@@ -241,6 +241,72 @@ machine-readable.
 What is *not* restored: the shell's working directory (back to the workspace root)
 and anything the earlier process had in memory. Files in `workspace/` are untouched,
 since they live on disk.
+
+## Security
+
+The agent runs arbitrary shell commands because that is the point. **The container
+is the security boundary, not the harness.** Nothing here tries to stop the agent
+from doing damage inside its container; what it does is avoid spreading your
+credentials into the artifacts that leave it.
+
+### What the harness does
+
+- **The API key never reaches the model or the screen.** It is stripped from the
+  environment every command inherits, and removed from tool output before the
+  model or your terminal sees it — so `cat .env` returns `OPENAI_API_KEY=[redacted]`
+  while the file on disk is untouched.
+- **It is not in any repr.** `Config.api_key` is `repr=False`, so a traceback or a
+  debug print cannot dump it.
+- **Secret-shaped strings are scrubbed from the log**: OpenAI `sk-…`, GitHub
+  `ghp_…`/`github_pat_…`, AWS `AKIA…`, Slack `xox…`, Google `AIza…`,
+  `Authorization: Bearer …`, `PRIVATE KEY` blocks, `PASSWORD=`/`TOKEN=`-style
+  assignments, and passwords embedded in URLs. Only the value is replaced, so
+  `AWS_SECRET_ACCESS_KEY=[redacted]` still reads sensibly. `--no-redact` turns the
+  pattern matching off; the harness's own key is scrubbed either way.
+- **Transcripts are private**: the log file is `0600` inside a `0700` directory, and
+  a workspace the harness creates is `0700`. Logs hold full file contents and
+  command output, so they are the most sensitive thing here.
+- **Loose credential permissions are reported**: `.env` or an `--api-key-file`
+  readable by other accounts prints a warning on startup.
+- **The key can stay out of the environment entirely** with
+  `--api-key-file PATH` (or `OPENAI_API_KEY_FILE`), which keeps it out of `env`
+  dumps, `docker inspect`, and `/proc/<pid>/environ`.
+- **The model is told that content is data.** The system prompt instructs it to
+  treat file contents, command output and fetched pages as data, and to report
+  rather than obey instructions found in them.
+
+### What it does not protect, honestly
+
+- **The agent shares a uid with the harness.** On Linux it can read
+  `/proc/<harness pid>/environ` when the key came from the environment, and it can
+  read an `--api-key-file` just as easily. Stripping the child environment stops
+  accidents, not a determined agent. **Use a dedicated, low-value, rotatable key
+  for anything you let an agent near**, and treat a container that ran an agent as
+  having seen that key.
+- **Do not mount host credentials.** `~/.ssh`, `~/.aws`, cloud metadata access, a
+  Docker socket: all reachable by any command the agent runs. The `docker run`
+  recipe that bind-mounts the source read-only also exposes `.env` to the agent —
+  the built image does not, since `.dockerignore` excludes it.
+- **Only the file tools are path-confined.** `read_file`/`write_file`/`edit_file`
+  cannot leave the workspace, and symlinks are resolved before the check — but that
+  is a guard rail against the model mis-aiming, not a sandbox. The shell goes
+  wherever the container allows.
+- **Prompt injection is mitigated by instruction only.** A model can be talked out
+  of any instruction. Assume anything the agent reads can influence what it does,
+  and keep secrets and reachable infrastructure out of the container.
+- **No command approval, by design.** Nothing prompts before `rm -rf`. A blocklist
+  would give a false sense of safety; a throwaway container is the real answer.
+
+### Practical checklist
+
+```sh
+chmod 600 .env                  # or use --api-key-file
+docker run --read-only --memory 2g --cpus 2 --pids-limit 512 ...   # cap the blast radius
+```
+
+Use a scoped key per container, rotate it after the container is gone, keep the
+workspace free of anything you would not paste into a chat, and read `logs/*.jsonl`
+before sharing one — redaction catches known shapes, not everything.
 
 ## Steering while it works
 
@@ -694,7 +760,9 @@ the summary text), `compaction_error`, `compaction_skipped`, `message_shrunk`,
 `history_trimmed`, `history_repaired`, `cwd_set`, `user_message` with
 `queued: true` for steering, `interrupted` (with `where`:
 `request`/`stream`/`tool`/`turn`), `pasted_code_block`, `llm_error`,
-`max_steps_reached`, `params_dropped`, `reasoning_effort_changed`, `session_end`.
+`max_steps_reached`, `params_dropped`, `reasoning_effort_changed`, and
+`session_end` (which carries the session's token totals). Every field is scrubbed
+of known secrets on the way in.
 
 `llm_request`/`llm_response` carry `purpose`: `turn` for normal calls,
 `compaction` for summary calls.
@@ -702,6 +770,9 @@ the summary text), `compaction_error`, `compaction_skipped`, `message_shrunk`,
 ```sh
 # what did the agent actually run?
 jq -r 'select(.type=="tool_call" and .name=="shell") | .arguments.command' logs/*.jsonl
+
+# what did a whole session cost?
+jq -r 'select(.type=="session_end") | "\(.tokens_in) in, \(.tokens_out) out, \(.tokens_thinking) thinking"' logs/*.jsonl
 
 # token usage per call
 jq -r 'select(.type=="llm_response") | .usage' logs/*.jsonl
@@ -719,17 +790,14 @@ Offline end-to-end checks against a scripted mock OpenAI server — no API key, 
 network:
 
 ```sh
-.venv/bin/python tests/test_harness.py
-.venv/bin/python tests/test_compaction.py
-.venv/bin/python tests/test_markdown.py
-.venv/bin/python tests/test_interrupt.py
-.venv/bin/python tests/test_cwd.py
-.venv/bin/python tests/test_paste.py
-.venv/bin/python tests/test_sessions.py
-.venv/bin/python tests/test_steer.py
-.venv/bin/python tests/test_reasoning.py
-.venv/bin/python tests/test_platform.py
+.venv/bin/python tests/run.py              # every suite, one command
+.venv/bin/python tests/run.py cwd steer    # just these
 ```
+
+A suite that records no checks is reported as a failure, not a pass — that catches
+a suite wired up wrongly, which is otherwise silent. Lint with
+`.venv/bin/pip install ruff && .venv/bin/ruff check .`; the rules live in
+`pyproject.toml`.
 
 `test_harness.py` covers the tool loop in streaming and non-streaming mode,
 truncation, workspace escapes (including symlinks), shell timeouts, edit failure
@@ -760,6 +828,12 @@ and a real `git init` / `git diff` in a child directory.
 (`last`, exact, prefix, path, ambiguous, missing), replay fidelity against a live
 history, re-truncation on load, compaction replay, a killed session with a damaged
 line and an unanswered tool call, and `--resume`/`--sessions` as subprocesses.
+
+`test_security.py` covers redaction (literal keys, every supported secret shape,
+and the innocent strings that must survive), that the key is absent from
+`Config`'s repr, that log files land at `0600` in a `0700` directory, that a whole
+turn reading a secret-bearing file leaks it to neither the model, the screen nor the
+log, `--api-key-file`, and the stripped child environment.
 
 `test_platform.py` exercises the Windows branches on POSIX by faking what they
 depend on: `os.killpg` and `signal.SIGKILL` removed, a stubbed `msvcrt`, `select()`

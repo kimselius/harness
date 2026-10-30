@@ -1,0 +1,33 @@
+# Dev tooling only. The harness is run from a checkout, not installed, so there is
+# no build backend here and `requirements.txt` stays the install path.
+#
+#   .venv/bin/pip install ruff
+#   .venv/bin/ruff check .
+
+[tool.ruff]
+line-length = 90
+target-version = "py311"
+
+[tool.ruff.lint]
+# The rules that have actually caught defects in this codebase: undefined and
+# unused names (F), import order (I), real bug patterns (B), and errors pylint
+# would flag (PLE).
+select = ["F", "I", "B", "PLE", "UP", "RUF"]
+ignore = [
+    # Blind `except Exception` is deliberate in the tool dispatcher, the console
+    # probes and the completer: a bug there must not take down the session.
+    "BLE001",
+    # datetime.timezone.utc is clearer than the UTC alias and works further back.
+    "UP017",
+    # Style preferences, not defects: list concatenation and next(iter(x)) read
+    # fine and churning them buys nothing.
+    "RUF005",
+    "RUF015",
+    # The noqa comments on mid-file imports are intentional: test modules adjust
+    # sys.path before importing the harness, which E402 would otherwise flag.
+    "RUF100",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Test modules import after sys.path setup by necessity.
+"tests/*.py" = ["E402"]

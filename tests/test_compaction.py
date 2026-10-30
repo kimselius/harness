@@ -11,39 +11,12 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
+import common  # noqa: E402
 import mock_server  # noqa: E402
+from common import check, make_agent, pairing_ok  # noqa: E402
 
 import context  # noqa: E402
 import tools as toolkit  # noqa: E402
-from agent import Agent  # noqa: E402
-from config import build_parser, config_from_args  # noqa: E402
-from logbook import Logbook  # noqa: E402
-
-failures: list[str] = []
-
-
-def check(label: str, condition: bool, detail: str = "") -> None:
-    if condition:
-        print(f"  ok   {label}")
-    else:
-        failures.append(label)
-        print(f"  FAIL {label} {detail}")
-
-
-def make_agent(tmp: Path, base_url: str, extra: list[str] | None = None) -> Agent:
-    args = build_parser().parse_args(
-        [
-            "--model", "mock",
-            "--base-url", base_url,
-            "--workspace", str(tmp / "ws"),
-            "--log-dir", str(tmp / "logs"),
-            "--prompt-file", str(tmp / "nope.md"),
-            "--no-stream",
-            *(extra or []),
-        ]
-    )
-    cfg = config_from_args(args)
-    return Agent(cfg, Logbook(cfg.log_path))
 
 
 def assistant(text: str, calls: list[tuple[str, str]] | None = None) -> dict:
@@ -67,18 +40,6 @@ def bulk_history(rounds: int, size: int = 2000) -> list[dict]:
     return out
 
 
-def pairing_ok(history: list[dict]) -> bool:
-    """Every tool message must follow an assistant message that called it."""
-    pending: set[str] = set()
-    for message in history:
-        role = message.get("role")
-        if role == "assistant":
-            pending |= {c["id"] for c in message.get("tool_calls") or []}
-        elif role == "tool":
-            if message["tool_call_id"] not in pending:
-                return False
-            pending.discard(message["tool_call_id"])
-    return not pending
 
 
 def test_meter() -> None:
@@ -299,12 +260,7 @@ def main() -> int:
         test_trim_guard(tmp, base_url)
         test_shrink_before_drop(tmp, base_url)
     server.shutdown()
-    print()
-    if failures:
-        print(f"{len(failures)} failed: {', '.join(failures)}")
-        return 1
-    print("all checks passed")
-    return 0
+    return common.report()
 
 
 if __name__ == "__main__":

@@ -1,8 +1,16 @@
 """The tool set: shell, read_file, write_file, edit_file.
 
+Each tool is one function plus the schema the model sees, declared together, with
+`TOOLS` at the bottom as the single list both exports derive from — so a tool
+cannot be registered under one name and advertised under another.
+
 Every tool returns a plain string for the model. Raise ToolError for failures the
 model should see and recover from. Tools return the *full* text; truncation happens
 in the agent loop so the log can keep the untruncated version.
+
+Two path rules, which the <state> block also states to the model:
+- file paths always resolve from the workspace root, never from the shell's cwd
+- the shell keeps its own working directory between calls
 """
 
 from __future__ import annotations
@@ -10,160 +18,45 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from config import Config
+from session import Session
 from util import ToolError, ToolInterrupted, display_path, resolve_in_workspace
 
 MAX_READ_BYTES = 20 * 1024 * 1024
+
+PATH_ARGUMENT = {
+    "type": "string",
+    "description": (
+        "File path, always relative to the workspace root and never to the "
+        "shell's current directory. It may not escape the workspace root."
+    ),
+}
 
 # Appended to every shell command so the final working directory can be read back
 # and carried into the next call, the way a real shell session behaves.
 CWD_MARKER = "__harness_cwd_6b1f__:"
 # The leading newline matters: without it the marker is glued to the last line of
 # output whenever a command does not end with one (`printf` without \n).
-# POSIX shell syntax, so it is only appended where /bin/sh runs the command.
-# On Windows the command would be handed to cmd.exe, which would choke on it, so
-# the probe is skipped there and the directory simply stays at the workspace root.
+# POSIX shell syntax, so it is only appended where /bin/sh runs the command. On
+# Windows the command goes to cmd.exe, which would choke on it, so the probe is
+# skipped there and the directory simply stays at the workspace root.
 POSIX_SHELL = os.name != "nt"
 CWD_PROBE = (
-    f'\n__harness_rc=$?\nprintf "\\n%s%s\\n" "{CWD_MARKER}" "$(pwd)"\n'
-    "exit $__harness_rc\n"
-) if POSIX_SHELL else ""
-
-TOOL_SCHEMAS: list[dict[str, Any]] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "shell",
-            "description": (
-                "Run a shell command (/bin/sh -c). Returns the exit code, the current "
-                "directory, and combined stdout/stderr. Use it for listing, searching, "
-                "git, running tests, installing packages, and anything else system "
-                "level. The working directory persists between calls: `cd sub` in one "
-                "call applies to every later call. It starts at the workspace root "
-                "and cannot leave it. Note that read_file, write_file and edit_file "
-                "ignore it: their paths are always relative to the workspace root, "
-                "the same way every tool result prints them."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "Command line to execute.",
-                    },
-                    "timeout": {
-                        "type": "number",
-                        "description": "Optional timeout in seconds for this command.",
-                    },
-                },
-                "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": (
-                "Read a UTF-8 text file from the workspace. Output is line numbered. "
-                "Use offset/limit to page through large files."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": (
-                            "File path, always relative to the workspace root and "
-                            "never to the shell's current directory. It may not "
-                            "escape the workspace root."
-                        ),
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "description": "1-based first line to read (default 1).",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of lines to read.",
-                    },
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": (
-                "Create a file or overwrite it completely. Parent directories are "
-                "created automatically. For changing part of an existing file, prefer "
-                "edit_file."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": (
-                            "File path, always relative to the workspace root and "
-                            "never to the shell's current directory. It may not "
-                            "escape the workspace root."
-                        ),
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Full file contents to write.",
-                    },
-                },
-                "required": ["path", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit_file",
-            "description": (
-                "Find and replace an exact substring in a file. old_string must occur "
-                "exactly once unless replace_all is true; include surrounding context "
-                "to make it unique. Whitespace and indentation must match exactly."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": (
-                            "File path, always relative to the workspace root and "
-                            "never to the shell's current directory. It may not "
-                            "escape the workspace root."
-                        ),
-                    },
-                    "old_string": {
-                        "type": "string",
-                        "description": "Exact text to find.",
-                    },
-                    "new_string": {
-                        "type": "string",
-                        "description": "Replacement text (empty string deletes).",
-                    },
-                    "replace_all": {
-                        "type": "boolean",
-                        "description": "Replace every occurrence (default false).",
-                    },
-                },
-                "required": ["path", "old_string", "new_string"],
-            },
-        },
-    },
-]
+    (
+        f'\n__harness_rc=$?\nprintf "\\n%s%s\\n" "{CWD_MARKER}" "$(pwd)"\n'
+        "exit $__harness_rc\n"
+    )
+    if POSIX_SHELL
+    else ""
+)
 
 
+# -- shared helpers ---------------------------------------------------------
 def _require_str(args: dict, key: str) -> str:
     value = args.get(key)
     if not isinstance(value, str):
@@ -175,13 +68,17 @@ def _read_text(path: Path, cfg: Config | None = None) -> str:
     if not path.exists():
         # State the resolved path. The rule that produced it is in the per-request
         # state block, so the model never has to infer it from an error message.
-        where = f"{display_path(cfg.workspace, path)} (resolved to {path})" if cfg else path
+        where = (
+            f"{display_path(cfg.workspace, path)} (resolved to {path})" if cfg else path
+        )
         raise ToolError(f"no such file: {where}")
     if path.is_dir():
         raise ToolError(f"{path} is a directory, not a file")
     size = path.stat().st_size
     if size > MAX_READ_BYTES:
-        raise ToolError(f"file is {size} bytes, too large to read (limit {MAX_READ_BYTES})")
+        raise ToolError(
+            f"file is {size} bytes, too large to read (limit {MAX_READ_BYTES})"
+        )
     data = path.read_bytes()
     if b"\x00" in data[:8192]:
         raise ToolError(f"{path} looks like a binary file; use shell tools instead")
@@ -209,21 +106,54 @@ def _kill_group(proc: subprocess.Popen) -> None:
         pass
 
 
-def tool_shell(args: dict, cfg: Config) -> str:
+# -- shell ------------------------------------------------------------------
+SHELL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "shell",
+        "description": (
+            "Run a shell command (/bin/sh -c). Returns the exit code, the current "
+            "directory, and combined stdout/stderr. Use it for listing, searching, "
+            "git, running tests, installing packages, and anything else system "
+            "level. The working directory persists between calls: `cd sub` in one "
+            "call applies to every later call. It starts at the workspace root "
+            "and cannot leave it. Note that read_file, write_file and edit_file "
+            "ignore it: their paths are always relative to the workspace root, "
+            "the same way every tool result prints them."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Command line to execute.",
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Optional timeout in seconds for this command.",
+                },
+            },
+            "required": ["command"],
+        },
+    },
+}
+
+
+def tool_shell(args: dict, cfg: Config, session: Session) -> str:
     command = _require_str(args, "command")
     requested = args.get("timeout")
     timeout = cfg.shell_timeout
     if isinstance(requested, (int, float)) and requested > 0:
         timeout = min(float(requested), cfg.max_shell_timeout)
 
-    if not cfg.cwd.is_dir():
+    if not session.cwd.is_dir():
         # The directory was removed underneath us. Fall back to the root *and*
         # record it, so the reported cwd matches where the command really ran.
-        cfg.cwd = cfg.workspace
+        session.cwd = session.root
     proc = subprocess.Popen(
         command + CWD_PROBE,
         shell=True,
-        cwd=str(cfg.cwd),
+        cwd=str(session.cwd),
         env=cfg.child_env(),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -245,10 +175,10 @@ def tool_shell(args: dict, cfg: Config) -> str:
         # reached it. Kill it here or it keeps running after the turn is gone.
         _kill_group(proc)
         output, _ = proc.communicate()
-        partial, _ = _take_cwd(output or "", cfg)
+        partial, _ = _take_cwd(output or "", session)
         raise ToolInterrupted(partial=partial.rstrip("\n")) from None
 
-    output, notes = _take_cwd(output or "", cfg)
+    output, notes = _take_cwd(output or "", session)
     status = (
         f"timed out after {timeout:g}s (killed)"
         if timed_out
@@ -256,10 +186,10 @@ def tool_shell(args: dict, cfg: Config) -> str:
     )
     body = output.rstrip("\n") if output.strip() else "(no output)"
     extra = f" ({'; '.join(notes)})" if notes else ""
-    return f"{status} · cwd: {cfg.cwd_label}{extra}\n--- output ---\n{body}"
+    return f"{status} · cwd: {session.cwd_label}{extra}\n--- output ---\n{body}"
 
 
-def _take_cwd(output: str, cfg: Config) -> tuple[str, list[str]]:
+def _take_cwd(output: str, session: Session) -> tuple[str, list[str]]:
     """Strip the cwd probe from the output and apply it to the session.
 
     The probe is missing when the command exits early (`exit 1`), was killed, or
@@ -273,12 +203,40 @@ def _take_cwd(output: str, cfg: Config) -> tuple[str, list[str]]:
     if head.endswith("\n"):  # the newline the probe itself printed
         head = head[:-1]
     reported = output[at + len(CWD_MARKER) :].split("\n", 1)[0].strip()
-    if reported and not cfg.set_cwd(Path(reported)):
+    if reported and not session.set_cwd(Path(reported)):
         notes.append("left the workspace, directory reset to the root")
     return head, notes
 
 
-def tool_read_file(args: dict, cfg: Config) -> str:
+# -- read_file --------------------------------------------------------------
+READ_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "read_file",
+        "description": (
+            "Read a UTF-8 text file from the workspace. Output is line numbered. "
+            "Use offset/limit to page through large files."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": PATH_ARGUMENT,
+                "offset": {
+                    "type": "integer",
+                    "description": "1-based first line to read (default 1).",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of lines to read.",
+                },
+            },
+            "required": ["path"],
+        },
+    },
+}
+
+
+def tool_read_file(args: dict, cfg: Config, session: Session) -> str:
     path = resolve_in_workspace(cfg.workspace, _require_str(args, "path"))
     text = _read_text(path, cfg)
     lines = text.splitlines()
@@ -297,17 +255,39 @@ def tool_read_file(args: dict, cfg: Config) -> str:
 
     if not window:
         return f"{display_path(cfg.workspace, path)} is empty"
-    numbered = "\n".join(
-        f"{offset + i:6d}\t{line}" for i, line in enumerate(window)
-    )
+    numbered = "\n".join(f"{offset + i:6d}\t{line}" for i, line in enumerate(window))
     header = (
-        f"{display_path(cfg.workspace, path)} "
-        f"(lines {offset}-{end} of {len(lines)})"
+        f"{display_path(cfg.workspace, path)} (lines {offset}-{end} of {len(lines)})"
     )
     return f"{header}\n{numbered}"
 
 
-def tool_write_file(args: dict, cfg: Config) -> str:
+# -- write_file -------------------------------------------------------------
+WRITE_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "write_file",
+        "description": (
+            "Create a file or overwrite it completely. Parent directories are "
+            "created automatically. For changing part of an existing file, prefer "
+            "edit_file."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": PATH_ARGUMENT,
+                "content": {
+                    "type": "string",
+                    "description": "Full file contents to write.",
+                },
+            },
+            "required": ["path", "content"],
+        },
+    },
+}
+
+
+def tool_write_file(args: dict, cfg: Config, session: Session) -> str:
     path = resolve_in_workspace(cfg.workspace, _require_str(args, "path"))
     content = _require_str(args, "content")
     if path.is_dir():
@@ -327,7 +307,40 @@ def tool_write_file(args: dict, cfg: Config) -> str:
     )
 
 
-def tool_edit_file(args: dict, cfg: Config) -> str:
+# -- edit_file --------------------------------------------------------------
+EDIT_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "edit_file",
+        "description": (
+            "Find and replace an exact substring in a file. old_string must occur "
+            "exactly once unless replace_all is true; include surrounding context "
+            "to make it unique. Whitespace and indentation must match exactly."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": PATH_ARGUMENT,
+                "old_string": {
+                    "type": "string",
+                    "description": "Exact text to find.",
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "Replacement text (empty string deletes).",
+                },
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "Replace every occurrence (default false).",
+                },
+            },
+            "required": ["path", "old_string", "new_string"],
+        },
+    },
+}
+
+
+def tool_edit_file(args: dict, cfg: Config, session: Session) -> str:
     path = resolve_in_workspace(cfg.workspace, _require_str(args, "path"))
     old = _require_str(args, "old_string")
     new = _require_str(args, "new_string")
@@ -356,18 +369,36 @@ def tool_edit_file(args: dict, cfg: Config) -> str:
     return f"Edited {display_path(cfg.workspace, path)} ({where} replaced)"
 
 
-REGISTRY: dict[str, Callable[[dict, Config], str]] = {
-    "shell": tool_shell,
-    "read_file": tool_read_file,
-    "write_file": tool_write_file,
-    "edit_file": tool_edit_file,
+# -- registry ---------------------------------------------------------------
+@dataclass(frozen=True)
+class Tool:
+    schema: dict[str, Any]
+    run: Callable[[dict, Config, Session], str]
+
+    @property
+    def name(self) -> str:
+        return self.schema["function"]["name"]
+
+
+# The one place a tool is declared. Both exports below derive from it, so the
+# advertised name and the dispatched name cannot drift apart.
+TOOLS: list[Tool] = [
+    Tool(SHELL_SCHEMA, tool_shell),
+    Tool(READ_SCHEMA, tool_read_file),
+    Tool(WRITE_SCHEMA, tool_write_file),
+    Tool(EDIT_SCHEMA, tool_edit_file),
+]
+
+TOOL_SCHEMAS: list[dict[str, Any]] = [tool.schema for tool in TOOLS]
+REGISTRY: dict[str, Callable[[dict, Config, Session], str]] = {
+    tool.name: tool.run for tool in TOOLS
 }
 
 
-def execute(name: str, args: dict, cfg: Config) -> str:
+def execute(name: str, args: dict, cfg: Config, session: Session) -> str:
     fn = REGISTRY.get(name)
     if fn is None:
         raise ToolError(f"unknown tool {name!r}; available: {', '.join(REGISTRY)}")
     if not isinstance(args, dict):
         raise ToolError("tool arguments must be a JSON object")
-    return fn(args, cfg)
+    return fn(args, cfg, session)

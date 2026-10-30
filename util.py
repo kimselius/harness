@@ -1,8 +1,86 @@
-"""Output truncation and workspace path confinement."""
+"""Output truncation, workspace path confinement, and secret redaction."""
 
 from __future__ import annotations
 
+import re
+from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
+
+REDACTED = "[redacted]"
+
+# High-confidence shapes only. A false positive here damages a transcript you
+# may need later, so this deliberately does not try to catch everything.
+SECRET_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+        re.S,
+    ),
+    re.compile(r"sk-[A-Za-z0-9_\-]{16,}"),
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"xox[abprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"AIza[0-9A-Za-z_\-]{35}"),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{20,}"),
+]
+
+# `NAME=value` / `NAME: value` for names that are secrets by convention. Only the
+# value is replaced, so the surrounding line still reads sensibly.
+SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b([a-z0-9_]*(?:api[_-]?key|secret|password|passwd|token|credential)"
+    r"[a-z0-9_]*)(\s*[:=]\s*)(['\"]?)([^\s'\"]{8,})\3"
+)
+
+# https://user:password@host
+URL_PASSWORD = re.compile(r"(://[^/\s:@]+:)([^/\s@]+)(@)")
+
+
+class Redactor:
+    """Keeps known secrets out of the session log.
+
+    Two levels on purpose:
+
+    - `scrub_output` removes only *our own* literal secrets (the API key, a
+      password in base_url). Those are never useful to the model, so they are
+      removed everywhere, including what the model sees.
+    - `scrub_log` additionally removes anything matching a secret shape. That is
+      applied to the log only: the agent may legitimately need to use a token it
+      found, but the log is the artifact that leaves the container.
+    """
+
+    def __init__(self, secrets: Iterable[str] = (), patterns: bool = True) -> None:
+        # Short strings would match everywhere; "sk-no-key" style placeholders are
+        # not worth redacting either.
+        self.secrets = sorted(
+            {s for s in secrets if s and len(s) >= 12}, key=len, reverse=True
+        )
+        self.patterns = patterns
+
+    def scrub_output(self, text: str) -> str:
+        """Remove the harness's own secrets from text shown to anyone."""
+        if not isinstance(text, str):
+            return text
+        for secret in self.secrets:
+            if secret in text:
+                text = text.replace(secret, REDACTED)
+        return text
+
+    def scrub_log(self, value: Any) -> Any:
+        """Scrub anything on its way into the log, walking containers."""
+        if isinstance(value, str):
+            text = self.scrub_output(value)
+            if not self.patterns:
+                return text
+            for pattern in SECRET_PATTERNS:
+                text = pattern.sub(REDACTED, text)
+            text = SECRET_ASSIGNMENT.sub(rf"\1\2\3{REDACTED}\3", text)
+            return URL_PASSWORD.sub(rf"\1{REDACTED}\3", text)
+        if isinstance(value, dict):
+            return {key: self.scrub_log(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self.scrub_log(item) for item in value]
+        return value
 
 
 class ToolError(Exception):

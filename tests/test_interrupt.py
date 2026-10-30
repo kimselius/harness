@@ -20,54 +20,15 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
+import common  # noqa: E402
 import mock_server  # noqa: E402
+from common import check, make_agent, pairing_ok  # noqa: E402
 
 import agent as agent_mod  # noqa: E402
 import markdown  # noqa: E402
 import tools as toolkit  # noqa: E402
-from agent import Agent  # noqa: E402
-from config import build_parser, config_from_args  # noqa: E402
 from llm import Reply  # noqa: E402
-from logbook import Logbook  # noqa: E402
 from util import ToolInterrupted  # noqa: E402
-
-failures: list[str] = []
-
-
-def check(label: str, condition: bool, detail: str = "") -> None:
-    if condition:
-        print(f"  ok   {label}")
-    else:
-        failures.append(label)
-        print(f"  FAIL {label} {detail}")
-
-
-def make_agent(tmp: Path, base_url: str, extra: list[str] | None = None) -> Agent:
-    args = build_parser().parse_args(
-        [
-            "--model", "mock",
-            "--base-url", base_url,
-            "--workspace", str(tmp / "ws"),
-            "--log-dir", str(tmp / "logs"),
-            "--prompt-file", str(tmp / "nope.md"),
-            "--no-stream",
-            *(extra or []),
-        ]
-    )
-    cfg = config_from_args(args)
-    return Agent(cfg, Logbook(cfg.log_path))
-
-
-def pairing_ok(history: list[dict]) -> bool:
-    pending: set[str] = set()
-    for message in history:
-        if message.get("role") == "assistant":
-            pending |= {c["id"] for c in message.get("tool_calls") or []}
-        elif message.get("role") == "tool":
-            if message["tool_call_id"] not in pending:
-                return False
-            pending.discard(message["tool_call_id"])
-    return not pending
 
 
 def interrupt_in(seconds: float) -> threading.Timer:
@@ -93,7 +54,8 @@ def tool_call(cid: str, name: str = "shell", **args) -> dict:
 
 def test_shell_interrupt_kills_children(tmp: Path, base_url: str) -> None:
     print("shell interrupt kills the process group")
-    cfg = make_agent(tmp / "s1", base_url).cfg
+    agent = make_agent(tmp / "s1", base_url)
+    cfg, session = agent.cfg, agent.session
     marker = "harness-interrupt-marker-7391"
     # Parent sh spawns a child sleep: both must die, not just the parent.
     command = f"echo starting; sh -c 'sleep 45 # {marker}' & sleep 45; echo never"
@@ -101,7 +63,7 @@ def test_shell_interrupt_kills_children(tmp: Path, base_url: str) -> None:
     interrupt_in(1.0)
     started = time.monotonic()
     try:
-        toolkit.tool_shell({"command": command, "timeout": 60}, cfg)
+        toolkit.tool_shell({"command": command, "timeout": 60}, cfg, session)
         check("ToolInterrupted raised", False, "no exception")
     except ToolInterrupted as exc:
         elapsed = time.monotonic() - started
@@ -276,12 +238,7 @@ def main() -> int:
         test_pasted_code_warning(tmp, base_url)
         test_prompt_contract(tmp, base_url)
     server.shutdown()
-    print()
-    if failures:
-        print(f"{len(failures)} failed: {', '.join(failures)}")
-        return 1
-    print("all checks passed")
-    return 0
+    return common.report()
 
 
 if __name__ == "__main__":

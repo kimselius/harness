@@ -8,19 +8,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tests"))
+
+import common  # noqa: E402
+from common import check  # noqa: E402
 
 import markdown  # noqa: E402
 
 ANSI = re.compile(r"\033\[[0-9;]*m")
-failures: list[str] = []
-
-
-def check(label: str, condition: bool, detail: str = "") -> None:
-    if condition:
-        print(f"  ok   {label}")
-    else:
-        failures.append(label)
-        print(f"  FAIL {label} {detail}")
 
 
 def plain(text: str) -> str:
@@ -198,12 +193,7 @@ def main() -> int:
     test_stream_matches_whole()
     test_partial_line_flushed()
     test_no_escape_leaks()
-    print()
-    if failures:
-        print(f"{len(failures)} failed: {', '.join(failures)}")
-        return 1
-    print("all checks passed")
-    return 0
+    return common.report()
 
 
 if __name__ == "__main__":

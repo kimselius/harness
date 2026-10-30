@@ -11,47 +11,24 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
-import mock_server  # noqa: E402
-
-from agent import Agent  # noqa: E402
-from config import build_parser, config_from_args  # noqa: E402
-from logbook import Logbook  # noqa: E402
-from util import ToolError, resolve_in_workspace, truncate  # noqa: E402
-
-failures: list[str] = []
-
-
-def check(label: str, condition: bool, detail: str = "") -> None:
-    if condition:
-        print(f"  ok   {label}")
-    else:
-        failures.append(label)
-        print(f"  FAIL {label} {detail}")
+import common  # noqa: E402
+from common import check  # noqa: E402
 
 
 def make_config(tmp: Path, base_url: str, stream: bool):
-    args = build_parser().parse_args(
-        [
-            "--model",
-            "mock",
-            "--base-url",
-            base_url,
-            "--workspace",
-            str(tmp / "ws"),
-            "--log-dir",
-            str(tmp / "logs"),
-            "--prompt-file",
-            str(tmp / "PROMPT.md"),
-            "--max-output-chars",
-            "2000",
-            "--max-output-lines",
-            "40",
-            "--shell-timeout",
-            "10",
-            *([] if stream else ["--no-stream"]),
-        ]
+    # The limits this suite asserts against.
+    return common.make_config(
+        tmp, base_url,
+        ["--max-output-chars", "2000", "--max-output-lines", "40",
+         "--shell-timeout", "10", "--prompt-file", str(tmp / "PROMPT.md")],
+        stream=stream,
     )
-    return config_from_args(args)
+
+import mock_server  # noqa: E402
+
+from agent import Agent  # noqa: E402
+from logbook import Logbook  # noqa: E402
+from util import ToolError, resolve_in_workspace, truncate  # noqa: E402
 
 
 def test_truncate() -> None:
@@ -188,9 +165,63 @@ def test_history_file(tmp: Path, base_url: str) -> None:
     check("writable", path.read_text() == "probe")
 
 
+def test_tool_registry() -> None:
+    print("tool registry")
+    import tools as toolkit
+
+    names = [tool.name for tool in toolkit.TOOLS]
+    check("one entry per tool", len(toolkit.TOOLS) == 4, str(len(toolkit.TOOLS)))
+    check("schemas derive from it",
+          [s["function"]["name"] for s in toolkit.TOOL_SCHEMAS] == names)
+    check("dispatch derives from it", list(toolkit.REGISTRY) == names)
+    check("no duplicate names", len(set(names)) == len(names))
+    check("every tool is callable", all(callable(t.run) for t in toolkit.TOOLS))
+    check("every schema has a description",
+          all(s["function"].get("description") for s in toolkit.TOOL_SCHEMAS))
+    check("every tool takes args, cfg, session",
+          all(t.run.__code__.co_argcount == 3 for t in toolkit.TOOLS))
+
+
+def test_session_state(tmp: Path, base_url: str) -> None:
+    print("session state")
+    from session import Session
+
+    cfg = make_config(tmp / "sess", base_url, stream=False)
+    session = Session(cfg.workspace)
+    check("starts at the root", session.cwd == session.root)
+    check("label is a dot at the root", session.cwd_label == ".")
+    check("state block names both", str(session.root) in session.state_block()
+          and "(.)" in session.state_block())
+    check("nothing counted yet", session.totals() == {
+        "tokens_in": 0, "tokens_out": 0, "tokens_thinking": 0, "requests": 0})
+
+    session.add_usage({"prompt_tokens": 1200, "completion_tokens": 300}, 120)
+    session.add_usage({"prompt_tokens": 800, "completion_tokens": 100}, None)
+    check("input totalled", session.tokens_in == 2000, str(session.tokens_in))
+    check("output totalled", session.tokens_out == 400, str(session.tokens_out))
+    check("thinking totalled", session.tokens_thinking == 120)
+    check("requests counted", session.requests == 2)
+    check("a response with no usage still counts as a request",
+          (session.add_usage(None, None), session.requests)[1] == 3)
+    line = session.totals_line()
+    check("totals read in thousands", "in 2.0k" in line and "out 400" in line, line)
+    check("thinking shown when present", "thinking 120" in line, line)
+
+    quiet = Session(cfg.workspace)
+    quiet.add_usage({"prompt_tokens": 5, "completion_tokens": 5}, 0)
+    check("thinking omitted when zero", "thinking" not in quiet.totals_line(),
+          quiet.totals_line())
+
+    # Config no longer carries the directory, which is what tools used to mutate.
+    check("config has no cwd", not hasattr(cfg, "cwd"))
+    check("config has no state_block", not hasattr(cfg, "state_block"))
+
+
 def test_completion(tmp: Path, base_url: str) -> None:
     print("command completion")
-    from main import COMMAND_NAMES, completions, setup_completion
+    from main import COMMANDS, completions, setup_completion
+
+    names = [command.name for command in COMMANDS]
 
     cfg = make_config(tmp / "comp", base_url, stream=False)
     agent = Agent(cfg, Logbook(cfg.log_path))
@@ -198,7 +229,10 @@ def test_completion(tmp: Path, base_url: str) -> None:
     (cfg.workspace / ".hidden").mkdir(exist_ok=True)
 
     check("bare slash offers everything",
-          completions("/", "/", agent) == [f"/{n}" for n in COMMAND_NAMES])
+          completions("/", "/", agent) == [f"/{n}" for n in names])
+    check("every command has help text",
+          all(command.help for command in COMMANDS))
+    check("aliases dispatch too", completions("/q", "/q", agent) == [])
     check("prefix narrows it", completions("/his", "/his", agent) == ["/history"])
     check("several matches", sorted(completions("/h", "/h", agent))
           == ["/help", "/history"])
@@ -256,15 +290,12 @@ def main() -> int:
         test_loop(tmp, base_url, stream=True)
         test_repair(tmp, base_url)
         test_history_file(tmp, base_url)
+        test_tool_registry()
+        test_session_state(tmp, base_url)
         test_completion(tmp, base_url)
         test_commands(tmp, base_url)
     server.shutdown()
-    print()
-    if failures:
-        print(f"{len(failures)} failed: {', '.join(failures)}")
-        return 1
-    print("all checks passed")
-    return 0
+    return common.report()
 
 
 if __name__ == "__main__":
