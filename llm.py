@@ -57,7 +57,10 @@ class Reply:
         interrupted: bool = False,
         reasoning: str = "",
     ) -> None:
-        self.content = content
+        # Blank lines around a reply carry nothing, and small models pad a
+        # tool-calling turn with a handful of them. Dropped once, here, so the
+        # history, the log, the result file and the terminal all agree.
+        self.content = content.strip("\n") if content else content
         self.tool_calls = tool_calls
         self.usage = usage
         self.finish_reason = finish_reason

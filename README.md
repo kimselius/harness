@@ -49,6 +49,145 @@ Any OpenAI-compatible endpoint works:
 .venv/bin/python main.py --base-url http://localhost:11434/v1 --model qwen2.5-coder
 ```
 
+## Unattended runs
+
+`-p` is meant to be driven by something other than a person: a shell script, a
+crontab, a `docker run`. Three things make that safe to rely on.
+
+**The exit code is true.**
+
+| code | meaning |
+| --- | --- |
+| 0 | the model finished and answered |
+| 1 | it failed — the endpoint was unreachable, the request was rejected, or no prompt was given without a terminal |
+| 3 | it ran out of tool rounds (`--max-steps`), so the task is probably half done |
+| 4 | it ran past `--max-seconds` |
+| 130 | Ctrl-C |
+| 143 | SIGTERM (`docker stop`, `timeout`, a supervisor shutting down) |
+
+Only 0 means the model decided it was done. 3 and 4 mean it was cut off
+mid-task — usually a sign the step is trying to do too much.
+
+**The streams are separate.** stdout carries the model's reply and nothing else;
+every bit of harness narration — tool calls, results, warnings, token counts —
+goes to stderr. So this works:
+
+```sh
+answer=$(.venv/bin/python main.py -p "what is in notes.txt?")   # just the answer
+.venv/bin/python main.py -p "do the thing" > out.txt 2> progress.log
+```
+
+Colour follows each stream independently, so a redirected file never gets escape
+codes while a terminal still shows coloured progress. `--quiet` drops progress
+entirely and keeps warnings and errors.
+
+**There is a machine-readable result.** `--result-file` writes one JSON object
+when the run ends, including when it fails, so a driver never parses stdout:
+
+```sh
+.venv/bin/python main.py -p "plan the work" \
+    --label planning --result-file /tmp/step1.json
+```
+
+```json
+{
+  "status": "ok", "exit_code": 0,
+  "text": "Planned 5 sections covering …",
+  "steps": 4, "tool_calls": 7,
+  "session": "20261102-141233-9ad41c", "label": "planning", "error": null,
+  "tokens_in": 38210, "tokens_out": 2904, "tokens_thinking": 0, "requests": 4
+}
+```
+
+`status` is one of `ok`, `error`, `max_steps`, `timeout`, `interrupted`. The file
+is written atomically and scrubbed like the session log, since it is another
+artifact that leaves the container. `--label` tags the run so it is findable in
+`--sessions` when a pipeline produces a dozen sessions a night.
+
+### Chaining runs
+
+Several agents in sequence, each starting with an empty context and handing over
+through files in the workspace:
+
+```sh
+set -e   # stop at the first failing step
+H=".venv/bin/python main.py --workspace work --quiet"
+$H --prompt-file prompts/plan.md    --label plan  -p "Read notes/ and write outline.txt"
+$H --prompt-file prompts/write.md   --label write -p "Write each section in outline.txt"
+$H --prompt-file prompts/review.md  --label check -p "Check the sections against the outline"
+```
+
+Each step is a fresh process, so there is nothing to clear between them, and any
+step can be re-run on its own against the files already there. The workspace is
+the contract — design the file layout deliberately, and make every prompt
+self-describing, because a step cannot see the conversation that produced its
+input.
+
+`examples/report/` is a complete worked example: seven steps that turn raw notes
+into a report, including two fan-out phases that run one agent per section. It
+ships with `run.sh` (host or inside a container) and `docker-pipeline.sh` (one
+container per step), and its README records what a real run against a 31B model
+cost — including the step that had to be split in two after it blew through
+`--max-steps`.
+
+If a step genuinely needs the previous step's *reasoning* rather than its files,
+share the session instead of the workspace:
+
+```sh
+.venv/bin/python main.py -p "analyse the logs" --result-file /tmp/a.json
+id=$(jq -r .session /tmp/a.json)
+.venv/bin/python main.py --resume "$id" -p "now write the fix"
+```
+
+### From cron
+
+```cron
+17 3 * * *  flock -n /tmp/harness.lock /srv/harness/examples/report/run.sh \
+              >> /var/log/harness.log 2>&1
+```
+
+`flock -n` stops a slow night from overlapping with the next one. Prefer
+`--max-seconds` over wrapping the call in `timeout`: the harness stops itself at
+a tool-round boundary, writes `session_end` and returns 4, where an external kill
+leaves the log short. Because the exit code is honest, cron's own
+mail-on-failure works.
+
+Note that cron has no terminal. Without `-p` and without anything on stdin the
+harness now exits 1 with an explanation, rather than printing a banner and
+reporting success — which is what a misconfigured job used to do, silently, every
+night.
+
+### Signals and containers
+
+`docker stop` sends SIGTERM and waits ten seconds before SIGKILL. The harness
+handles SIGTERM as an interrupt: it kills any running command *and its children*,
+records `session_end`, writes the result file, and exits 143 straight away.
+
+Two different things are being protected here. Being SIGKILLed instead costs you
+the `session_end` record, the result file and ten seconds — that is the container
+case, where tearing down the namespace does at least kill the agent's processes
+for you. Outside a container there is more at stake: shell commands run in their
+own process group on purpose, so a killed harness leaves whatever it started
+running. That is why the handler kills the group rather than just exiting, and
+`tests/test_oneshot.py` checks with `pgrep` that nothing survives.
+
+```sh
+docker run --rm --env-file .env harness -p "run the test suite"; echo $?
+docker run -d --env-file .env harness -p "long job"   # then: docker wait <id>
+```
+
+Both report the agent's exit code, so the container's status *is* the run's
+status. Verified against the image: a `docker stop` mid-command exits in under a
+second with 143, the `✗ ERROR: interrupted by user` tool result is recorded, and
+no child survives.
+
+One caveat, and it is why the image runs `tini` as PID 1: the handler cannot be
+installed until Python and the OpenAI SDK have loaded, and **PID 1 silently
+discards signals it has no handler for**. A `docker stop` inside that startup
+window was dropped entirely — ten seconds of waiting, then SIGKILL, no
+`session_end`. With `tini` in front there is no window. If you override the
+entrypoint, pass `--init`.
+
 ### In a container
 
 Two ways, both kept because they suit different habits:
@@ -80,6 +219,19 @@ docker run -it --rm \
 Ubuntu 24.04 with `python3`, plus the tools an agent reaches for constantly. The
 entrypoint is `main.py`, so a bare run opens the REPL and `harness -p "do a thing"`
 is a one-shot.
+
+**PID 1 is `tini`, not the harness**, which matters more than it sounds for an
+agent that spawns processes. Two things were measured in this image before it was
+added. A `docker stop` in the first fraction of a second was *silently discarded*,
+because PID 1 drops any signal it has no handler for and the harness does not
+install its SIGTERM handler until the interpreter and the OpenAI SDK have loaded —
+the container then sat out the full ten-second grace period and was SIGKILLed,
+losing its `session_end` record. And every backgrounded command that outlived its
+shell left a permanent `[sleep] <defunct>` zombie, since the harness never calls
+`wait()` on processes it did not start. `tini` costs 250 KB and removes both.
+
+If you override the entrypoint, you take that on yourself — add `--init` (see
+below).
 
 It runs as **uid 1001**, not root (1001 because Ubuntu 24.04 already gives its own
 `ubuntu` user 1000). The source files stay owned by root and world-readable, so the
@@ -114,6 +266,7 @@ writable, and it runs as uid 1001:
 ```sh
 mkdir -p workspace logs
 docker run -it --rm \
+  --init \
   --user 1001:1001 \
   -v "$PWD":/harness:ro \
   -v "$PWD/workspace":/ws \
@@ -134,6 +287,11 @@ The `--target /tmp/deps` plus `PYTHONPATH` is what makes this work as non-root: 
 1001 cannot write to the image's `site-packages`, but `/tmp` is writable, and
 `HOME=/tmp` keeps anything looking for a home directory happy. The same uid caveat
 as above applies to the two writable mounts.
+
+`--init` is not optional here. The outer `sh -c` would otherwise be PID 1, and a
+shell neither forwards SIGTERM to the `python` it is waiting on nor reaps orphans —
+so `docker stop` would wait out its grace period and kill the container every
+time.
 
 For a one-shot, extend the inner command — flags go to `main.py`, not to
 `docker run`:
@@ -469,181 +627,6 @@ Two more things exist so a wrong path cannot be silent: `write_file` reports any
 directories it had to create (`new directory created: a, a/b`), and a missing file
 reports the path it actually resolved to.
 
-## Sessions## Sessions
-
-Every run is a session with an id like `20261026-105057-b1c53e`, and its log is
-`logs/<id>.jsonl` — the filename *is* the id.
-
-```sh
-.venv/bin/python main.py --sessions            # list them
-.venv/bin/python main.py --resume              # continue the most recent
-.venv/bin/python main.py --resume 20261026-105057-b1c53e
-.venv/bin/python main.py --resume 20261026-10  # unambiguous prefix is enough
-```
-
-Resuming replays the conversation from the log, prints it to the terminal so you
-can see where you left off, and appends new events to that same file, so one session stays one file however many times you come back to it.
-`seq` numbering continues where it stopped. In the REPL, `/sessions` lists and
-`/resume <id>` switches without restarting.
-
-The log is the only state, so a session survives the process being killed:
-
-- A half-written final line (a `kill -9` mid-write) is skipped.
-- Tool calls with no recorded result are answered with an error on load, so the
-  replayed history is valid for strict APIs.
-- Tool output is re-truncated with your *current* limits rather than stored twice,
-  so lowering `--max-output-chars` shrinks a resumed session's context too.
-- Recorded compactions are replayed, so a session that compacted three times comes
-  back at its compacted size instead of re-expanding to everything.
-- A note is appended telling the model it is a new process, so it does not assume a
-  command it started earlier is still running.
-
-The replay shows the last 12 messages in the same shapes a live turn uses — your
-prompts, tool calls, tool results, replies — with a count of anything older.
-`/history all` prints the lot, `/history 40` a specific number. Harness-authored
-messages (the resume note, compaction summaries) are indented and dimmed rather than
-shown as things you typed. One-shot `-p` runs skip the replay so their output stays
-machine-readable.
-
-What is *not* restored: the shell's working directory (back to the workspace root)
-and anything the earlier process had in memory. Files in `workspace/` are untouched,
-since they live on disk.
-
-## Steering while it works
-
-You do not have to wait for a turn to finish, and you do not have to interrupt it
-to say something. Type while the agent is working and the message is queued:
-
-```
-> refactor the parser
-⏺ shell  pytest -q
-you know what, start with the tokenizer       ← typed while pytest runs
-» queued, will be sent next step
-  ⎿ exit code: 1 · cwd: .
-+ your message was added to the context: you know what, start with the tokenizer
-⏺ read_file  tokenizer.py
-```
-
-A reader thread watches stdin for the duration of the turn and collects whole
-lines. The agent loop drains the queue at the start of each step, right before the
-next request goes out — never between a tool call and its result, so the history
-stays valid. The model therefore sees your message alongside the latest tool
-result and can change course mid-task.
-
-Typed during the model's final step, when there is no next step to pick it up? Then
-it runs as the next turn automatically. Typed without pressing Enter? It is handed
-back as the start of your next prompt rather than dropped. Lines beginning with `/`
-are queued as plain messages, not run as commands — commands need the prompt.
-
-Interrupting and steering are different tools: Ctrl-C stops the work, typing
-redirects it.
-
-## Interrupting
-
-Ctrl-C stops the turn at whatever stage it is in, and never quits the session
-(Ctrl-D or `/exit` does that):
-
-- **During a shell command** the command's whole process group is killed, children
-  included. Commands run in their own process group — which means the terminal's
-  Ctrl-C does *not* reach them — so the harness kills them explicitly; otherwise a
-  `sleep 300` or a runaway build would keep running after the turn was gone. Output
-  produced before the interrupt is kept and shown.
-- **Mid-stream** the partial reply is kept, the connection is closed, and any
-  half-built tool call is discarded — its arguments are truncated JSON and must
-  never be executed.
-- **While waiting on the model** the request is dropped.
-
-In every case the remaining tool calls of that round are answered with an error
-instead of being run, so the history stays valid, and a note is appended telling the
-model it was interrupted and not to resume. The next message continues the same
-session. One-shot runs (`-p`) exit 130.
-
-## Terminal output
-
-Replies are rendered to ANSI as they stream: headings bold, `**bold**` and
-`` `code` `` styled, bullets normalized to `•`, fences replaced with a dim rule
-carrying the language label. Code block contents are passed through verbatim so
-they stay copy-pasteable, and emphasis is never applied inside a code span — shell
-globs like `**/*.py` or `ls *.py and 2 * 3` stay literal.
-
-Rendering is line buffered, so output arrives a line at a time rather than a token
-at a time; `--no-markdown` restores verbatim token-by-token streaming. Styling turns
-itself off when stdout is not a tty or `NO_COLOR` is set, so piped output and the
-JSONL log always hold the model's raw text.
-
-The system prompt also tells the model its output goes to a terminal of N columns
-and to skip headings and tables, which is the cheaper half of the fix: less markup
-emitted beats more markup parsed.
-
-If a reply does contain a code block of 8+ lines, the harness warns: that usually
-means the model pasted a file at you instead of calling `write_file`. The event is
-recorded in the log as `pasted_code_block` so you can grep for the habit.
-
-## System prompt
-
-If `PROMPT.md` exists it is used as the system prompt, otherwise the built-in one
-is. It is re-read before every model request, so edits take effect on your next
-message — no restart. An `<environment>` block is always appended so the model
-knows its real constraints: workspace root, output limits, shell timeout, terminal
-width, and the tool-use contract — act on files with `read_file`/`write_file`/
-`edit_file`, never print contents or diffs for the user to copy and paste, never ask
-the user to run a command it can run itself, and stop rather than retry when a tool
-reports an interrupt. Those rules survive a custom `PROMPT.md` because they describe
-the harness, not style.
-
-```sh
-cp PROMPT.md.example PROMPT.md
-```
-
-## Everything stays in this directory
-
-Relative paths are resolved against the harness directory, not your shell's cwd,
-so nothing is written outside the checkout:
-
-| path | contents |
-| --- | --- |
-| `workspace/` | the only directory the agent can touch (`--workspace`) |
-| `logs/session-<ts>.jsonl` | one transcript per session (`--log-dir`) |
-| `logs/.harness_history` | REPL line history (lives with the logs, so a read-only source tree still works) |
-| `.env` | credentials and defaults |
-
-## Tools
-
-- **shell** — `sh -c` in the workspace root, combined stdout/stderr, exit code
-  reported. Killed by process group on timeout (default 120s, per-call override
-  capped at 900s). Harness credentials (`OPENAI_*`, `HARNESS_*`, `ANTHROPIC_*`) are
-  stripped from the child environment.
-- **read_file** — line-numbered text with `offset`/`limit` paging; refuses binaries
-  and files over 20 MB.
-- **write_file** — create or overwrite, parent directories created automatically.
-- **edit_file** — exact substring find/replace. Fails if `old_string` is missing or
-  ambiguous unless `replace_all` is set, so edits can't land in the wrong place.
-
-Paths are resolved (symlinks included) and rejected if they fall outside the
-workspace.
-
-### The working directory persists
-
-The shell behaves like one session rather than a series of unrelated commands: `cd
-sub` in one call applies to every later call, and `read_file`/`write_file`/
-`edit_file` resolve relative paths against the same directory. So working on a
-subproject is what you would expect —
-
-```
-cd repo                    → cwd: repo
-git diff --stat            → runs in repo, no path prefix needed
-read_file f.txt            → reads repo/f.txt
-```
-
-— instead of prefixing every command with the path or wrapping everything in
-`cd x && …`. Each shell result reports where it is (`exit code: 0 · cwd: repo`), and
-the directory is read back from the real `pwd` after the command, so `cd` inside a
-compound command sticks too.
-
-It cannot leave the workspace: a command that ends up outside resets to the root and
-says so. If the directory is deleted underneath it, the next command falls back to
-the root rather than failing. `/cwd` shows it and `/cwd sub` sets it by hand.
-
 ## Output limits
 
 Tool results handed to the model are clamped to ~6000 chars / 250 lines, keeping the
@@ -853,21 +836,32 @@ present in the next one.
 paste arrives as one user message, that single lines still produce separate turns,
 and that slash commands are unaffected.
 
+`test_oneshot.py` covers everything a script depends on, through real
+subprocesses: every exit code (including an unreachable endpoint, which used to
+exit 0), that no prompt without a terminal fails instead of succeeding silently,
+the stdout/stderr split and the absence of escape codes when redirected,
+`--quiet`, the result file's shape and redaction on both success and failure,
+`--max-seconds`, `--label`, and a SIGTERM mid-command that must exit 143 promptly,
+write its result file, and leave no orphaned child.
+
 ## Layout
 
 ```
-main.py      CLI + REPL
-agent.py     tool loop, truncation, compaction, history repair
+main.py      CLI + REPL, exit codes, result file, signal handling
+agent.py     tool loop, truncation, compaction, history repair, Outcome
 llm.py       OpenAI-compatible client (streaming + non-streaming)
 tools.py     shell / read_file / write_file / edit_file + JSON schemas
+session.py   per-run state: working directory and token totals
 context.py   token metering, split points, summary prompt, harness notes
 sessions.py  session discovery, listing, replay from the log
 steer.py     queued stdin while a turn is running
 markdown.py  markdown to ANSI, streaming and whole-string
 config.py    flags, env, .env loading, system prompt assembly
 logbook.py   JSONL writer
-util.py      truncation + path confinement
-ui.py        terminal formatting
+util.py      truncation + path confinement + redaction
+ui.py        terminal formatting, stdout/stderr split
+
+examples/report/   seven-step pipeline: notes in, report out
 ```
 
 ## Known limits
@@ -877,3 +871,12 @@ ui.py        terminal formatting
   starts forgetting things; `--summary-model` can point at a stronger model.
 - Nothing stops the model from running a destructive command. That's the point of
   running it in a container.
+- A long-running command prints nothing until it finishes. The system prompt tells
+  the model to redirect long jobs to a file and poll, but live tool-output
+  streaming is not implemented.
+- `--max-seconds` is checked between tool rounds, not inside one. A command already
+  running is bounded by `--shell-timeout` instead, so the worst case is one
+  command's timeout past the deadline.
+- There is no pipeline runner inside the harness. Chaining is a shell script
+  (`examples/report/run.sh`), which also means no way to re-run "step 4 onwards"
+  except by what the script itself offers.

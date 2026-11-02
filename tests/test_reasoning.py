@@ -6,7 +6,7 @@ import io
 import json
 import sys
 import tempfile
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -68,8 +68,7 @@ def test_captured_and_logged(tmp: Path, base_url: str, stream: bool) -> None:
         tmp / f"cap-{label}", base_url,
         ["--reasoning-effort", "high", *([] if stream else ["--no-stream"])],
     )
-    out = io.StringIO()
-    with redirect_stdout(out):
+    with common.capture() as cap:
         final = agent.run("think about it")
 
     check("answer returned", final == "the answer", final)
@@ -87,9 +86,10 @@ def test_captured_and_logged(tmp: Path, base_url: str, stream: bool) -> None:
     check("not in history",
           all(THOUGHT not in json.dumps(m) for m in agent.history),
           json.dumps(agent.history)[:120])
-    check("hidden by default", THOUGHT not in out.getvalue())
-    check("but its cost is reported", "thought for" in out.getvalue(),
-          out.getvalue()[-120:])
+    check("hidden by default", THOUGHT not in cap.both)
+    check("but its cost is reported", "thought for" in cap.err, cap.err[-120:])
+    check("the reply alone is on stdout", cap.out.strip() == "the answer",
+          repr(cap.out))
 
 
 def test_show_thinking(tmp: Path, base_url: str) -> None:
@@ -98,14 +98,13 @@ def test_show_thinking(tmp: Path, base_url: str) -> None:
     mock_server.set_script([("the answer", [])])
     mock_server.REASONING.append(THOUGHT)
     agent = make_agent(tmp / "show", base_url, ["--show-thinking"])
-    out = io.StringIO()
-    with redirect_stdout(out):
+    with common.capture() as cap:
         agent.run("think about it")
-    screen = out.getvalue()
-    check("reasoning printed", THOUGHT in screen, screen[:160])
-    check("labelled", "thinking" in screen)
-    check("answer still printed", "the answer" in screen)
-    check("no duplicate cost note", "thought for" not in screen)
+    check("reasoning printed", THOUGHT in cap.err, cap.err[:160])
+    check("labelled", "thinking" in cap.err)
+    check("reasoning kept off stdout", THOUGHT not in cap.out)
+    check("answer still printed", "the answer" in cap.out)
+    check("no duplicate cost note", "thought for" not in cap.both)
     check("still absent from history",
           all(THOUGHT not in json.dumps(m) for m in agent.history))
 
@@ -182,8 +181,7 @@ def test_graceful_degradation(tmp: Path, base_url: str) -> None:
     mock_server.REJECT.add("reasoning_effort")
     agent = make_agent(tmp / "reject", base_url,
                        ["--reasoning-effort", "high", "--no-stream"])
-    out = io.StringIO()
-    with redirect_stdout(out):
+    with common.capture() as cap:
         final = agent.run("hello")
     check("turn still succeeded", final == "ok anyway", final)
     check("retried without it", "reasoning_effort" not in mock_server.REQUESTS[-1],
@@ -191,7 +189,7 @@ def test_graceful_degradation(tmp: Path, base_url: str) -> None:
     check("first attempt did send it",
           "reasoning_effort" in mock_server.REQUESTS[0])
     check("drop logged", any(r["type"] == "params_dropped" for r in records(agent)))
-    check("user told", "rejected" in out.getvalue(), out.getvalue()[:160])
+    check("user told", "rejected" in cap.err, cap.err[:160])
 
     # And it stops trying on later calls in the same session.
     before = len(mock_server.REQUESTS)
@@ -242,26 +240,28 @@ def test_model_change_resets_calibration(tmp: Path, base_url: str) -> None:
     check("dropped parameters get another chance", agent.llm.supports_effort)
 
 
-def test_printer_interleaving() -> None:
-    print("printer ordering")
-    out = io.StringIO()
-    with redirect_stdout(out):
+def test_printer_streams() -> None:
+    """Thinking is commentary, so it belongs on stderr with the rest of it."""
+    print("printer stream split")
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
         printer = _Printer(markdown_on=False, style=False, show_thinking=True)
         printer.feed_reasoning("pondering...")
         printer.feed("the answer")
         printer.finish("the answer")
-    screen = out.getvalue()
-    check("thinking before answer",
-          screen.index("pondering") < screen.index("the answer"), repr(screen))
-    check("newline between them", "\n" in screen[screen.index("pondering"):],
-          repr(screen))
+    check("answer on stdout", out.getvalue().strip() == "the answer",
+          repr(out.getvalue()))
+    check("thinking on stderr", "pondering" in err.getvalue(), repr(err.getvalue()))
+    check("thinking not on stdout", "pondering" not in out.getvalue())
+    check("thinking closed with a newline", err.getvalue().endswith("\n"),
+          repr(err.getvalue()))
 
-    out = io.StringIO()
-    with redirect_stdout(out):
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
         printer = _Printer(markdown_on=False, style=False, show_thinking=False)
         printer.feed_reasoning("secret")
         printer.finish("visible")
-    check("hidden when off", "secret" not in out.getvalue())
+    check("hidden when off", "secret" not in out.getvalue() + err.getvalue())
     check("answer still shown", "visible" in out.getvalue())
 
 
@@ -280,7 +280,7 @@ def main_() -> int:
         test_graceful_degradation(tmp, base_url)
         test_unrelated_400_is_not_blamed_on_parameters(tmp, base_url)
         test_model_change_resets_calibration(tmp, base_url)
-        test_printer_interleaving()
+        test_printer_streams()
     server.shutdown()
     return common.report()
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import atexit
 import json
+import os
+import signal
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -16,7 +18,7 @@ import sessions
 import steer
 import tools as toolkit
 import ui
-from agent import Agent
+from agent import ERROR, INTERRUPTED, MAX_STEPS, OK, TIMEOUT, Agent, Outcome
 from config import (
     Config,
     anchor,
@@ -26,6 +28,82 @@ from config import (
     normalize_effort,
 )
 from logbook import Logbook
+
+# Which signal ended the run, if any, so the exit code can say which.
+_SIGNAL: int | None = None
+
+# Exit codes a calling script can branch on. 2 belongs to argparse.
+EXIT_CODES = {OK: 0, ERROR: 1, MAX_STEPS: 3, TIMEOUT: 4}
+EXIT_SIGINT = 130
+EXIT_SIGTERM = 143
+
+
+def _on_terminate(signum: int, frame: object) -> None:
+    """Turn SIGTERM into the interrupt path the harness already handles well.
+
+    `docker stop` and `timeout` both send SIGTERM, and PID 1 ignores it by
+    default — so without this a container waits out the ten second grace period
+    and is then killed mid-write, leaving no session_end record and orphaning the
+    shell tool's children (they run in their own process group on purpose).
+    """
+    global _SIGNAL
+    _SIGNAL = signum
+    raise KeyboardInterrupt
+
+
+def install_signal_handlers() -> None:
+    if hasattr(signal, "SIGTERM"):
+        try:
+            signal.signal(signal.SIGTERM, _on_terminate)
+        except (OSError, ValueError):
+            pass  # not the main thread, or a platform that refuses
+
+
+def exit_code(outcome: Outcome) -> int:
+    if outcome.status == INTERRUPTED:
+        terminated = _SIGNAL is not None and _SIGNAL == getattr(
+            signal, "SIGTERM", None
+        )
+        return EXIT_SIGTERM if terminated else EXIT_SIGINT
+    return EXIT_CODES.get(outcome.status, 1)
+
+
+def write_result(cfg: Config, agent: Agent, code: int) -> None:
+    """Record how the run ended, for a script that should not parse stdout.
+
+    Written atomically so a driver polling the file never sees half of it, and
+    scrubbed like the session log, because it is an artifact that leaves the
+    container.
+    """
+    if not cfg.result_file:
+        return
+    outcome = agent.outcome
+    payload = {
+        "status": outcome.status,
+        "exit_code": code,
+        "text": outcome.text,
+        "steps": outcome.steps,
+        "tool_calls": outcome.tool_calls,
+        "error": outcome.error,
+        "session": agent.log.session_id,
+        "label": cfg.label,
+        **agent.session.totals(),
+    }
+    body = json.dumps(
+        cfg.redactor().scrub_log(payload), ensure_ascii=False, indent=2, default=str
+    )
+    path = cfg.result_file
+    temp = path.with_name(path.name + ".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp.write_text(body + "\n", encoding="utf-8")
+        try:
+            os.chmod(temp, 0o600)
+        except OSError:
+            pass
+        temp.replace(path)
+    except OSError as exc:
+        ui.error(f"! could not write --result-file {path}: {exc.strerror}")
 
 
 def history_file(cfg: Config) -> Path:
@@ -242,7 +320,8 @@ def cmd_limits(agent: Agent, rest: str) -> None:
     ui.info(
         f"output: {cfg.max_output_chars} chars / {cfg.max_output_lines} lines · "
         f"shell timeout: {cfg.shell_timeout:g}s (max {cfg.max_shell_timeout:g}s) · "
-        f"max steps: {cfg.max_steps}"
+        f"max steps: {cfg.max_steps} · "
+        f"max seconds: {f'{cfg.max_seconds:g}' if cfg.max_seconds else 'unlimited'}"
     )
     ui.info(
         f"reasoning_effort: {cfg.reasoning_effort or 'off (model default)'} · "
@@ -397,7 +476,8 @@ def handle_command(line: str, agent: Agent) -> bool:
     return command.run(agent, rest) is not False
 
 
-def run_turn(agent: Agent, message: str) -> None:
+def run_turn(agent: Agent, message: str) -> Outcome:
+    """One turn. Always leaves agent.outcome describing how it ended."""
     # Watch stdin for the duration of the turn so typing is queued, not lost.
     if agent.inbox:
         agent.inbox.start()
@@ -405,11 +485,21 @@ def run_turn(agent: Agent, message: str) -> None:
         agent.run(message)
     except KeyboardInterrupt:
         # Backstop: the agent handles interrupts per step, this catches the gaps.
-        print()
+        ui.narrate("\n")
         agent.note_interrupt("turn")
+        agent.outcome = Outcome(
+            status=INTERRUPTED, text="", tokens=agent.session.totals()
+        )
     except Exception as exc:
-        ui.error(f"! {type(exc).__name__}: {exc}")
+        # An error has to survive as the turn's outcome, not just as a printed
+        # line: a run that could not reach the model must not look successful.
+        detail = f"{type(exc).__name__}: {exc}"
+        ui.error(f"! {detail}")
         agent.repair_history(reason=f"harness error: {exc}")
+        agent.log.event("turn_error", error=detail)
+        agent.outcome = Outcome(
+            status=ERROR, text="", error=detail, tokens=agent.session.totals()
+        )
     finally:
         if agent.inbox:
             agent.inbox.stop()
@@ -427,7 +517,10 @@ def run_turn(agent: Agent, message: str) -> None:
         parts.append(detail)
     used = agent.used_tokens()
     parts.append(f"ctx ~{used}/{cfg.context_tokens} ({100 * used / cfg.context_tokens:.0f}%)")
+    if agent.outcome.status != OK:
+        parts.append(agent.outcome.status)
     ui.info(f"  [{cfg.model}] " + " · ".join(parts))
+    return agent.outcome
 
 
 def list_sessions(log_dir: Path, limit: int = 20) -> None:
@@ -517,6 +610,8 @@ def main() -> int:
         list_sessions(anchor(args.log_dir))
         return 0
     cfg = config_from_args(args)
+    ui.set_quiet(cfg.quiet)
+    install_signal_handlers()
     log = Logbook(cfg.log_path, scrub=cfg.redactor().scrub_log)
     log.session_start(cfg, resumed=cfg.resumed)
     agent = Agent(cfg, log)
@@ -524,27 +619,44 @@ def main() -> int:
 
     # One-shot: -p flag, or a message piped on stdin.
     oneshot = args.prompt
-    if oneshot is None and not sys.stdin.isatty():
+    interactive = sys.stdin.isatty()
+    if oneshot is None and not interactive:
         piped = sys.stdin.read().strip()
         oneshot = piped or None
     if oneshot:
         if resume_stats is not None:
             report_resume(agent, resume_stats, transcript=False)
-        run_turn(agent, oneshot)
-        log.event("session_end", mode="oneshot", interrupted=agent.interrupted,
-                  **agent.session.totals())
-        return 130 if agent.interrupted else 0  # 130 = terminated by SIGINT
+        outcome = run_turn(agent, oneshot)
+        code = exit_code(outcome)
+        log.event("session_end", mode="oneshot", status=outcome.status,
+                  exit_code=code, **agent.session.totals())
+        write_result(cfg, agent, code)
+        return code
+    if not interactive:
+        # An unattended run with nothing to do used to print the banner, hit EOF
+        # and exit 0 — so a misconfigured cron job reported success every night
+        # while doing nothing at all.
+        ui.error(
+            "No prompt. Pass -p 'your instruction', or pipe one on stdin. "
+            "A terminal is required for the interactive prompt."
+        )
+        log.event("session_end", mode="oneshot", status=ERROR,
+                  exit_code=1, **agent.session.totals())
+        agent.outcome = Outcome(status=ERROR, error="no prompt and stdin is not a tty")
+        write_result(cfg, agent, 1)
+        return 1
 
     setup_readline(history_file(cfg))
     setup_completion(agent)
     agent.inbox = steer.InputQueue()
     agent.inbox.on_queued = lambda text: ui.info("» queued, will be sent next step")
-    print(
+    ui.plain(
         ui.bold("harness")
         + ui.dim(" — /help for commands, Ctrl-C to interrupt, Ctrl-D to exit")
     )
     ui.info(
         f"model {cfg.model} · workspace {cfg.workspace} · prompt {cfg.prompt_source}"
+        + (f" · label {cfg.label}" if cfg.label else "")
     )
     ui.info(
         f"context {cfg.context_tokens} tokens · "
@@ -564,11 +676,13 @@ def main() -> int:
             line = prefix + read_message(ui.input_prompt(where + ui.cyan("> ")))
             prefix = ""
         except EOFError:
-            print()
+            ui.narrate("\n")
             break
         except KeyboardInterrupt:
+            ui.narrate("\n")
+            if _SIGNAL is not None:
+                break  # SIGTERM: shut down, unlike Ctrl-C
             # Ctrl-C interrupts work, it does not quit the session.
-            print()
             ui.info("(interrupted — Ctrl-D or /exit to quit)")
             continue
         line = line.strip()
@@ -592,11 +706,13 @@ def main() -> int:
         if agent.inbox:
             prefix = agent.inbox.take_leftover()
 
+    code = EXIT_SIGTERM if _SIGNAL is not None else 0
     log.event("session_end", mode="interactive", messages=len(agent.history),
-              **agent.session.totals())
+              exit_code=code, **agent.session.totals())
     ui.info(f"session total: {agent.session.totals_line()}")
     ui.info("bye")
-    return 0
+    write_result(cfg, agent, code)
+    return code
 
 
 if __name__ == "__main__":

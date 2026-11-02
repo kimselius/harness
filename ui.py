@@ -30,15 +30,29 @@ def _enable_windows_vt() -> bool:
 
 # Old consoles that cannot do VT get no colour, which also means no escape codes
 # in the prompt and so nothing for a line editor to miscount.
-_ENABLED = sys.stdout.isatty() and not os.getenv("NO_COLOR") and _enable_windows_vt()
+_VT = not os.getenv("NO_COLOR") and _enable_windows_vt()
+# Two streams, two answers. stdout carries the model's reply, stderr carries the
+# harness's narration, and either one may be a terminal while the other is a file.
+_COLOR_OUT = sys.stdout.isatty() and _VT
+_COLOR_ERR = sys.stderr.isatty() and _VT
+_QUIET = False
 
 
 def colors_enabled() -> bool:
-    return _ENABLED
+    """Whether the model's reply (stdout) can carry colour."""
+    return _COLOR_OUT
+
+
+def set_quiet(quiet: bool) -> None:
+    """Silence progress narration. Warnings and errors still come through."""
+    global _QUIET
+    _QUIET = quiet
 
 
 def _c(code: str, text: str) -> str:
-    return f"\033[{code}m{text}\033[0m" if _ENABLED else text
+    # Either destination being a terminal is enough to build the escape codes;
+    # _emit strips them again when stderr in particular cannot show them.
+    return f"\033[{code}m{text}\033[0m" if (_COLOR_OUT or _COLOR_ERR) else text
 
 
 def dim(t: str) -> str:
@@ -95,6 +109,18 @@ def enable_readline_prompts(module: Any = None) -> bool:
     return _READLINE_SAFE
 
 
+def _emit(text: str) -> None:
+    """Write one line of narration.
+
+    All of it goes to stderr, so stdout holds nothing but the model's reply and
+    `harness -p … > answer.txt` is exactly that answer. Flushed on every line
+    because the two streams interleave on a terminal.
+    """
+    if not _COLOR_ERR:
+        text = _ANSI.sub("", text)
+    print(text, file=sys.stderr, flush=True)
+
+
 def input_prompt(text: str) -> str:
     """Mark colour codes as zero-width for readline.
 
@@ -121,6 +147,8 @@ _one_line = one_line  # internal alias
 
 def tool_call(name: str, args: dict) -> None:
     """One-line summary of what the model is about to do."""
+    if _QUIET:
+        return
     if name == "shell":
         detail = args.get("command", "")
     elif name == "read_file":
@@ -141,32 +169,55 @@ def tool_call(name: str, args: dict) -> None:
             detail += " (replace_all)"
     else:
         detail = json.dumps(args, default=str)
-    print(f"{cyan('⏺')} {bold(name)} {dim(_one_line(detail))}")
+    _emit(f"{cyan('⏺')} {bold(name)} {dim(_one_line(detail))}")
 
 
 def tool_result(text: str, is_error: bool = False, lines: int = 3) -> None:
     """Preview of a tool result: first few lines, dimmed."""
+    if _QUIET and not is_error:
+        return
     body = text.splitlines() or [""]
     marker = red("  ✗") if is_error else green("  ⎿")
-    print(f"{marker} {dim(_one_line(body[0], 110))}")
-    for extra in body[1:lines]:
-        print(f"    {dim(_one_line(extra, 110))}")
+    out = [f"{marker} {dim(_one_line(body[0], 110))}"]
+    out += [f"    {dim(_one_line(extra, 110))}" for extra in body[1:lines]]
     remaining = len(body) - lines
     if remaining > 0:
-        print(f"    {dim(f'… +{remaining} more lines')}")
+        out.append(f"    {dim(f'… +{remaining} more lines')}")
+    _emit("\n".join(out))
 
 
 def assistant_prefix() -> None:
-    print(green("assistant"), end=" ", flush=True)
+    """Label the reply on stderr, so the reply itself stays clean on stdout."""
+    if _QUIET:
+        return
+    if _COLOR_ERR:
+        print(green("assistant"), end=" ", file=sys.stderr, flush=True)
+    else:
+        print("assistant", file=sys.stderr, flush=True)
+
+
+def narrate(chunk: str) -> None:
+    """Dimmed narration without a line break, for streamed reasoning text."""
+    if _QUIET:
+        return
+    text = dim(chunk) if _COLOR_ERR else _ANSI.sub("", chunk)
+    print(text, end="", file=sys.stderr, flush=True)
+
+
+def plain(text: str) -> None:
+    """Narration at full brightness (the startup banner)."""
+    if not _QUIET:
+        _emit(text)
 
 
 def info(text: str) -> None:
-    print(dim(text))
+    if not _QUIET:
+        _emit(dim(text))
 
 
 def warn(text: str) -> None:
-    print(yellow(text))
+    _emit(yellow(text))
 
 
 def error(text: str) -> None:
-    print(red(text))
+    _emit(red(text))

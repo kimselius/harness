@@ -7,9 +7,11 @@ on reset()/report() so several suites can run in one process.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -80,6 +82,39 @@ def make_agent(
 ) -> Agent:
     cfg = make_config(tmp, base_url, extra, stream)
     return Agent(cfg, Logbook(cfg.log_path))
+
+
+class Captured:
+    """Both output streams of a block, kept apart.
+
+    The harness splits them deliberately — stdout carries the model's reply so it
+    can be redirected on its own, stderr carries narration — so a test has to say
+    which one it means.
+    """
+
+    def __init__(self) -> None:
+        self._out = io.StringIO()
+        self._err = io.StringIO()
+
+    @property
+    def out(self) -> str:
+        return self._out.getvalue()
+
+    @property
+    def err(self) -> str:
+        return self._err.getvalue()
+
+    @property
+    def both(self) -> str:
+        """Everything, in the order a terminal would show it well enough."""
+        return self.out + self.err
+
+
+@contextmanager
+def capture():
+    cap = Captured()
+    with redirect_stdout(cap._out), redirect_stderr(cap._err):
+        yield cap
 
 
 def pairing_ok(history: list[dict]) -> bool:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
 import context
@@ -11,11 +12,36 @@ import markdown
 import tools as toolkit
 import ui
 from config import Config
-from context import INTERRUPT_NOTE, SUMMARY_FALLBACK, step_limit_note
+from context import INTERRUPT_NOTE, SUMMARY_FALLBACK, deadline_note, step_limit_note
 from llm import LLM
 from logbook import Logbook
 from session import Session
 from util import ToolError, ToolInterrupted, truncate
+
+# How a turn ended. `ok` is the only status that means the model decided it was
+# finished; everything else means the turn was cut short, which a caller driving
+# the harness from a script needs to be able to tell apart.
+OK = "ok"
+ERROR = "error"
+MAX_STEPS = "max_steps"
+INTERRUPTED = "interrupted"
+TIMEOUT = "timeout"
+
+
+@dataclass
+class Outcome:
+    """The result of one turn, for callers that are not a human at a terminal."""
+
+    status: str = OK
+    text: str = ""
+    steps: int = 0
+    tool_calls: int = 0
+    error: str | None = None
+    tokens: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def ok(self) -> bool:
+        return self.status == OK
 
 
 class _Printer:
@@ -36,23 +62,32 @@ class _Printer:
         self.started = False
 
     def _write(self, text: str) -> None:
+        # Nothing opens the reply with blank lines, so a leading run of them is
+        # model padding. Dropping it here covers the raw (--no-markdown) path,
+        # where there is no line renderer to hold them back.
+        if not self.started and not text.strip():
+            return
         if not self.started:
             ui.assistant_prefix()
             self.started = True
         print(text, end="", flush=True)
 
     def feed_reasoning(self, chunk: str) -> None:
-        """Streamed reasoning text. Hidden unless asked for, never in history."""
+        """Streamed reasoning text. Hidden unless asked for, never in history.
+
+        Goes to stderr: it is commentary on the work, not the answer, so it must
+        not land in a redirected stdout.
+        """
         if not self.show_thinking:
             return
         if not self.thinking_open:
-            print(ui.dim("thinking "), end="", flush=True)
+            ui.narrate("thinking ")
             self.thinking_open = True
-        print(ui.dim(chunk), end="", flush=True)
+        ui.narrate(chunk)
 
     def end_reasoning(self) -> None:
         if self.thinking_open:
-            print()
+            ui.narrate("\n")
             self.thinking_open = False
 
     def feed(self, chunk: str) -> None:
@@ -92,6 +127,8 @@ class Agent:
         self.compactions = 0
         self.interrupted = False
         self.last_reasoning_tokens: int | None = None
+        # How the last turn ended. Set at every exit of run().
+        self.outcome = Outcome()
         # Optional InputQueue: messages typed while the turn is running.
         self.inbox: Any = None
 
@@ -332,14 +369,36 @@ class Agent:
         ui.warn("! interrupted")
 
     # -- main loop ---------------------------------------------------------
+    def _finish(
+        self, status: str, text: str, steps: int, calls: int, error: str | None = None
+    ) -> str:
+        """Record how the turn ended, then hand the text back as before."""
+        self.outcome = Outcome(
+            status=status,
+            text=text,
+            steps=steps,
+            tool_calls=calls,
+            error=error,
+            tokens=self.session.totals(),
+        )
+        self.log.event(
+            "turn_end", status=status, steps=steps, tool_calls=calls, error=error
+        )
+        return text
+
     def run(self, user_message: str) -> str:
         self.history.append({"role": "user", "content": user_message})
         self.log.event("user_message", content=user_message)
         self.interrupted = False
         self.last_reasoning_tokens = None
         final_text = ""
+        calls = 0
+        step = 0
+        started = time.monotonic()
 
         for step in range(1, self.cfg.max_steps + 1):
+            if self._past_deadline(started):
+                return self._finish(TIMEOUT, final_text, step - 1, calls)
             # Pick up steering typed while the previous step was running, before
             # the next request goes out. History is well formed at this point:
             # every tool call of the last round already has its result.
@@ -360,7 +419,7 @@ class Agent:
                 # Interrupted while waiting for the model; nothing partial to keep.
                 printer.finish("")
                 self.note_interrupt("request")
-                return final_text
+                return self._finish(INTERRUPTED, final_text, step, calls)
             printer.finish(reply.content)
             self._note_reasoning(reply)
             self._warn_about_pasted_code(reply.content)
@@ -370,7 +429,7 @@ class Agent:
                     self.history.append(reply.as_message())
                     final_text = reply.content
                 self.note_interrupt("stream")
-                return final_text
+                return self._finish(INTERRUPTED, final_text, step, calls)
 
             self.session.add_usage(reply.usage, reply.reasoning_tokens)
             if reply.usage:
@@ -381,7 +440,7 @@ class Agent:
                 final_text = reply.content
 
             if not reply.tool_calls:
-                return final_text
+                return self._finish(OK, final_text, step, calls)
 
             for call in reply.tool_calls:
                 if self.interrupted:
@@ -395,17 +454,35 @@ class Agent:
                         }
                     )
                     continue
+                calls += 1
                 self.history.append(self._run_tool(call, step))
             if self.interrupted:
                 self.note_interrupt("tool")
-                return final_text
+                return self._finish(INTERRUPTED, final_text, step, calls)
 
         ui.warn(f"! stopped after {self.cfg.max_steps} tool rounds (--max-steps)")
         self.log.event("max_steps_reached", steps=self.cfg.max_steps)
         self.history.append(
             {"role": "user", "content": step_limit_note(self.cfg.max_steps)}
         )
-        return final_text
+        return self._finish(MAX_STEPS, final_text, step, calls)
+
+    def _past_deadline(self, started: float) -> bool:
+        """Whether --max-seconds has run out. Checked between steps only.
+
+        A tool already running is not cut short here; `--shell-timeout` bounds
+        that, so the worst case is one command's timeout past the deadline.
+        """
+        limit = self.cfg.max_seconds
+        if not limit:
+            return False
+        elapsed = time.monotonic() - started
+        if elapsed < limit:
+            return False
+        ui.warn(f"! stopped after {elapsed:.0f}s (--max-seconds {limit:g})")
+        self.log.event("deadline_reached", limit=limit, elapsed=round(elapsed, 1))
+        self.history.append({"role": "user", "content": deadline_note(limit)})
+        return True
 
     # -- tool dispatch -----------------------------------------------------
     def _run_tool(self, call: dict[str, Any], step: int) -> dict[str, Any]:

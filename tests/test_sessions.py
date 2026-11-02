@@ -261,7 +261,9 @@ def test_cli_resume(tmp: Path, base_url: str) -> None:
     again = subprocess.run(base + ["--resume", "-p", "what was the magic word?"],
                            env=env, capture_output=True, text=True, timeout=120)
     check("--resume runs", again.returncode == 0, again.stderr[-300:])
-    check("prints what it resumed", "resumed" in again.stdout, again.stdout[:200])
+    check("prints what it resumed", "resumed" in again.stderr, again.stderr[:200])
+    check("stdout is only the reply", again.stdout.strip() == "kumquat",
+          repr(again.stdout))
     sent = mock_server.REQUESTS[-1]["messages"]
     check("earlier turn was replayed",
           any("kumquat" in (m.get("content") or "") for m in sent))
@@ -278,48 +280,42 @@ def test_cli_resume(tmp: Path, base_url: str) -> None:
 
 def test_transcript_rendering(tmp: Path, base_url: str) -> None:
     print("transcript rendering")
-    import io
-    from contextlib import redirect_stdout
-
     import main as cli
 
     mock_server.set_script(
         [("", [("shell", {"command": "ls -la"})]), ("all finished", [])]
     )
     agent = make_agent(tmp / "render", base_url)
-    with redirect_stdout(io.StringIO()):
+    with common.capture():
         agent.run("look around")
 
-    out = io.StringIO()
-    with redirect_stdout(out):
+    with common.capture() as cap:
         cli.print_transcript(agent, limit=None)
-    screen = out.getvalue()
+    screen = cap.both
     check("user message shown", "look around" in screen, screen[:120])
     check("tool call shown", "ls -la" in screen and "shell" in screen, screen[:200])
     check("tool result shown", "exit code" in screen, screen[:300])
     check("assistant reply shown", "all finished" in screen)
+    check("tool activity is narration, not stdout", "ls -la" not in cap.out, cap.out)
 
     # Harness-authored messages are marked, not shown as things you typed.
     agent.history.append({"role": "user", "content": context.RESUME_NOTE})
-    out = io.StringIO()
-    with redirect_stdout(out):
+    with common.capture() as cap:
         cli.print_transcript(agent, limit=None)
-    lines = [l for l in out.getvalue().splitlines() if "resumed in a new process" in l]
+    lines = [l for l in cap.both.splitlines() if "resumed in a new process" in l]
     check("harness note is indented, not prompted", lines and lines[0].startswith("  "),
           repr(lines[0]) if lines else "missing")
 
     # Long sessions show a tail plus a count of what was skipped.
     agent.history = [{"role": "user", "content": f"message {i}"} for i in range(30)]
-    out = io.StringIO()
-    with redirect_stdout(out):
+    with common.capture() as cap:
         cli.print_transcript(agent)
-    screen = out.getvalue()
+    screen = cap.both
     check("only the tail is printed", "message 29" in screen and "message 0" not in screen)
     check("says how many were hidden", "18 earlier messages" in screen, screen[:120])
-    out = io.StringIO()
-    with redirect_stdout(out):
+    with common.capture() as cap:
         cli.print_transcript(agent, limit=None)
-    check("limit=None shows everything", "message 0" in out.getvalue())
+    check("limit=None shows everything", "message 0" in cap.both)
 
     # An unparseable tool call must not crash the replay.
     agent.history = [{
@@ -327,10 +323,9 @@ def test_transcript_rendering(tmp: Path, base_url: str) -> None:
         "tool_calls": [{"id": "x", "type": "function",
                         "function": {"name": "shell", "arguments": "{bad json"}}],
     }]
-    out = io.StringIO()
-    with redirect_stdout(out):
+    with common.capture() as cap:
         cli.print_transcript(agent, limit=None)
-    check("broken arguments survive", "shell" in out.getvalue(), out.getvalue()[:120])
+    check("broken arguments survive", "shell" in cap.both, cap.both[:120])
 
 
 def test_resume_shows_the_conversation(tmp: Path, base_url: str) -> None:

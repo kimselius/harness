@@ -59,6 +59,13 @@ def step_limit_note(max_steps: int) -> str:
     )
 
 
+def deadline_note(seconds: float) -> str:
+    return (
+        f"[harness] Time limit ({seconds:g}s) reached. The turn was stopped. "
+        "Nothing is still running."
+    )
+
+
 RESUME_NOTE = (
     "[harness] This session was resumed in a new process. Everything above is "
     "earlier history, so do not assume a command you ran before is still running."

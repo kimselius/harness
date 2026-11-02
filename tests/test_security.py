@@ -156,7 +156,7 @@ def test_turn_does_not_leak(tmp: Path, base_url: str) -> None:
           any("OPENAI_API_KEY" in m for m in tool_messages), str(tool_messages)[:120])
 
 
-def test_api_key_file(tmp: Path) -> None:
+def test_api_key_file(tmp: Path, base_url: str) -> None:
     print("--api-key-file")
     key_file = tmp / "key.txt"
     key_file.write_text(f"{KEY}\n", encoding="utf-8")
@@ -173,17 +173,24 @@ def test_api_key_file(tmp: Path) -> None:
     check("whitespace stripped", "\n" not in cfg.api_key)
     check("absent from the environment", "OPENAI_API_KEY" not in os.environ)
 
-    # A world-readable credentials file is worth a warning.
+    # A world-readable credentials file is worth a warning. This has to be a run
+    # that actually reaches config_from_args: --sessions returns before the key
+    # file is ever opened, so it could never produce this warning — it used to
+    # pass here only by matching the warning about the repository's own .env.
     key_file.chmod(0o644)
+    mock_server.set_script([("fine", [])])
     result = subprocess.run(
         [sys.executable, str(ROOT / "main.py"), "--api-key-file", str(key_file),
          "--workspace", str(tmp / "kf2" / "ws"), "--log-dir", str(tmp / "kf2" / "logs"),
-         "--sessions"],
+         "--base-url", base_url, "--model", "mock", "--no-stream",
+         "-p", "anything, this only has to reach config_from_args"],
         capture_output=True, text=True, timeout=60,
         env={**os.environ, "OPENAI_API_KEY": ""},
     )
     check("warns about loose permissions", "readable by other users" in result.stderr,
-          result.stderr[:160])
+          result.stderr[:200])
+    check("names the file it means", str(key_file) in result.stderr,
+          result.stderr[:200])
 
     missing = config_from_args.__module__  # keep the import used
     check("module wired", bool(missing))
@@ -218,7 +225,7 @@ def main_() -> int:
             test_config_hides_the_key(tmp)
             test_log_is_scrubbed_and_private(tmp)
             test_turn_does_not_leak(tmp, base_url)
-            test_api_key_file(tmp)
+            test_api_key_file(tmp, base_url)
             test_env_not_passed_to_commands(tmp)
     finally:
         server.shutdown()

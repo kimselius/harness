@@ -117,13 +117,20 @@ class Renderer:
 
 
 class StreamRenderer:
-    """Buffers a stream into lines and renders each completed line."""
+    """Buffers a stream into lines and renders each completed line.
+
+    Blank lines are held rather than written straight out, which drops the ones
+    that lead or trail a reply while keeping the ones between paragraphs. Small
+    models pad a tool-calling turn with a handful of bare newlines, and in a
+    one-shot run stdout *is* the deliverable, so that padding is not free.
+    """
 
     def __init__(self, write, style: bool = True) -> None:
         self.renderer = Renderer(style)
         self.write = write
         self.buffer = ""
         self.wrote_anything = False
+        self.held_blanks = 0
 
     def feed(self, chunk: str) -> None:
         self.buffer += chunk
@@ -135,8 +142,16 @@ class StreamRenderer:
         if self.buffer:
             self._emit(self.buffer)
             self.buffer = ""
+        self.held_blanks = 0  # trailing blank lines are never written
 
     def _emit(self, line: str) -> None:
+        if not line.strip():
+            if self.wrote_anything:
+                self.held_blanks += 1
+            return  # leading blanks are dropped outright
+        if self.held_blanks:
+            self.write("\n" * self.held_blanks)
+            self.held_blanks = 0
         self.wrote_anything = True
         self.write(self.renderer.line(line) + "\n")
 

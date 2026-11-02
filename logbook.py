@@ -68,6 +68,7 @@ class Logbook:
             base_url=cfg.base_url,
             workspace=str(cfg.workspace),
             prompt_source=cfg.prompt_source,
+            label=cfg.label,
             pid=os.getpid(),
             limits={
                 "max_output_chars": cfg.max_output_chars,

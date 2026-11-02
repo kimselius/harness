@@ -101,6 +101,7 @@ def summarize(path: Path) -> dict[str, Any]:
         "started": None,
         "last": None,
         "model": None,
+        "label": None,
         "turns": 0,
         "tool_calls": 0,
         "compactions": 0,
@@ -110,9 +111,12 @@ def summarize(path: Path) -> dict[str, Any]:
     for record in _records(path):
         kind = record.get("type")
         info["last"] = record.get("ts") or info["last"]
-        if kind == "session_start":
-            info["started"] = record.get("ts")
-            info["model"] = record.get("model")
+        if kind in ("session_start", "session_resumed"):
+            # A resume appends to the same file, so the newest label wins.
+            if kind == "session_start":
+                info["started"] = record.get("ts")
+            info["model"] = record.get("model") or info["model"]
+            info["label"] = record.get("label") or info["label"]
         elif kind == "user_message":
             content = record.get("content") or ""
             if not content.startswith("[harness]"):
@@ -214,6 +218,8 @@ def load_history(
 def format_row(info: dict[str, Any]) -> str:
     started = (info.get("started") or "")[:16].replace("T", " ")
     bits = [f"{info['turns']} turns", f"{info['tool_calls']} tools"]
+    if info.get("label"):
+        bits.insert(0, str(info["label"]))
     if info["compactions"]:
         bits.append(f"{info['compactions']} compactions")
     if info["interrupted"]:

@@ -20,6 +20,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/home/harness
 
 # python3 runs the harness; the rest is what an agent reaches for constantly.
+# tini is the exception — it is not for the agent, it is PID 1. See ENTRYPOINT.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 \
         python3-pip \
@@ -30,6 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ripgrep \
         less \
         procps \
+        tini \
     && rm -rf /var/lib/apt/lists/*
 
 # Dedicated unprivileged account. 1001 is free on Ubuntu 24.04, whose own
@@ -55,6 +57,19 @@ RUN mkdir -p workspace logs && chown -R 1001:1001 workspace logs
 
 USER 1001:1001
 
-# Args land on main.py: bare `docker run -it <image>` opens the REPL, and
+# tini is PID 1, the harness is its child. Two measured reasons, both specific to
+# an agent that spawns processes:
+#
+#  - PID 1 discards any signal it has no handler for. The harness installs a
+#    SIGTERM handler, but not until the interpreter and the OpenAI SDK have
+#    loaded, so a `docker stop` inside that window was silently dropped: the
+#    container sat out the full ten second grace period and was then SIGKILLed,
+#    losing the session_end record. With tini there is no window.
+#  - A backgrounded command that outlives the shell that started it gets
+#    reparented to PID 1 on exit. The harness never calls wait() on processes it
+#    did not start, so with the harness as PID 1 those became permanent
+#    `[sleep] <defunct>` zombies, one per backgrounded job. tini reaps them.
+#
+# Args still land on main.py: bare `docker run -it <image>` opens the REPL, and
 # `docker run --rm <image> -p "do a thing"` runs one shot.
-ENTRYPOINT ["python3", "main.py"]
+ENTRYPOINT ["/usr/bin/tini", "--", "python3", "main.py"]

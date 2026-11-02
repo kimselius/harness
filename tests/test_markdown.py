@@ -157,6 +157,35 @@ def test_partial_line_flushed() -> None:
     check("close is idempotent", len(chunks) == 1)
 
 
+def test_blank_line_padding() -> None:
+    """Small models pad a turn with bare newlines; stdout is the deliverable."""
+    print("blank line handling")
+
+    def stream(text: str) -> str:
+        chunks: list[str] = []
+        renderer = markdown.StreamRenderer(chunks.append, style=False)
+        renderer.feed(text)
+        renderer.close()
+        return "".join(chunks)
+
+    check("a whitespace-only reply writes nothing", stream("\n\n\n\n") == "",
+          repr(stream("\n\n\n\n")))
+    check("leading blanks dropped", stream("\n\n\nhello\n") == "hello\n",
+          repr(stream("\n\n\nhello\n")))
+    check("trailing blanks dropped", stream("hello\n\n\n\n") == "hello\n",
+          repr(stream("hello\n\n\n\n")))
+    check("paragraph breaks kept",
+          stream("one\n\ntwo\n") == "one\n\ntwo\n", repr(stream("one\n\ntwo\n")))
+    check("multi-line gaps kept as written",
+          stream("one\n\n\ntwo\n") == "one\n\n\ntwo\n",
+          repr(stream("one\n\n\ntwo\n")))
+    check("blank lines inside code blocks survive",
+          stream("```\na\n\nb\n```\n") == "```\na\n\nb\n```\n",
+          repr(stream("```\na\n\nb\n```\n")))
+    check("a lone space is still blank", stream("  \nx\n") == "x\n",
+          repr(stream("  \nx\n")))
+
+
 def test_no_escape_leaks() -> None:
     print("escape hygiene")
     samples = [
@@ -192,6 +221,7 @@ def main() -> int:
     test_style_off()
     test_stream_matches_whole()
     test_partial_line_flushed()
+    test_blank_line_padding()
     test_no_escape_leaks()
     return common.report()
 

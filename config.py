@@ -115,6 +115,10 @@ class Config:
     show_thinking: bool
     extra_body: dict
     redact: bool
+    max_seconds: float  # 0 = no wall-clock limit
+    label: str | None  # free-text tag for finding a run in a pipeline
+    result_file: Path | None
+    quiet: bool
 
     @property
     def compact_threshold(self) -> int:
@@ -230,6 +234,44 @@ def build_parser() -> argparse.ArgumentParser:
         "-p",
         "--prompt",
         help="Run a single prompt non-interactively and exit.",
+    )
+    p.add_argument(
+        "--result-file",
+        default=os.getenv("HARNESS_RESULT_FILE") or None,
+        metavar="PATH",
+        help=(
+            "Write a JSON object describing how the run ended (status, final text, "
+            "token totals, session id) so a script does not have to parse stdout. "
+            "Written even when the run fails."
+        ),
+    )
+    p.add_argument(
+        "--label",
+        default=os.getenv("HARNESS_LABEL") or None,
+        metavar="TEXT",
+        help=(
+            "Tag this run, so it is recognisable in --sessions and in the result "
+            "file. Useful when a pipeline produces several sessions per day."
+        ),
+    )
+    p.add_argument(
+        "--max-seconds",
+        type=float,
+        default=_env_float("HARNESS_MAX_SECONDS", 0.0),
+        metavar="N",
+        help=(
+            "Wall-clock limit for a turn, 0 for none. Checked between tool rounds, "
+            "so a command already running is still bounded by --shell-timeout "
+            "rather than cut off at exactly N seconds."
+        ),
+    )
+    p.add_argument(
+        "--quiet",
+        action="store_true",
+        help=(
+            "Suppress progress output on stderr; warnings and errors still appear. "
+            "The model's reply still goes to stdout."
+        ),
     )
     p.add_argument(
         "--model",
@@ -496,4 +538,8 @@ def config_from_args(args: argparse.Namespace) -> Config:
         show_thinking=args.show_thinking,
         extra_body=extra_body,
         redact=not args.no_redact,
+        max_seconds=max(0.0, args.max_seconds),
+        label=(args.label or "").strip() or None,
+        result_file=anchor(args.result_file) if args.result_file else None,
+        quiet=args.quiet,
     )

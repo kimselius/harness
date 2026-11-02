@@ -28,6 +28,7 @@ SUITES = [
     "security",
     "reasoning",
     "sessions",
+    "oneshot",
     "interrupt",
     "steer",
     "paste",
