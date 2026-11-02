@@ -60,7 +60,7 @@ crontab, a `docker run`. Three things make that safe to rely on.
 | --- | --- |
 | 0 | the model finished and answered |
 | 1 | it failed — the endpoint was unreachable, the request was rejected, or no prompt was given without a terminal |
-| 3 | it ran out of tool rounds (`--max-steps`), so the task is probably half done |
+| 3 | it ran out of tool rounds (`--max-steps`), so the task is probably half done — `text` holds a closing summary of what did get done |
 | 4 | it ran past `--max-seconds` |
 | 130 | Ctrl-C |
 | 143 | SIGTERM (`docker stop`, `timeout`, a supervisor shutting down) |
@@ -634,8 +634,30 @@ head and tail with an explicit truncation marker. The **full, untruncated** outp
 always goes to the JSONL log, so nothing is lost for later follow-up. Tune with
 `--max-output-chars` / `--max-output-lines`.
 
-Each user message gets at most `--max-steps` (default 30) tool rounds; on overrun
-the model is told to stop and summarize.
+Each user message gets at most `--max-steps` (default 30) tool rounds. On overrun
+the harness does **not** simply stop: it spends one more request asking the model
+to say what it got done and what is left, with **no tools offered**. Withholding
+the tools is what guarantees that call terminates — a model stuck in a loop cannot
+loop again.
+
+That turn is the difference between a usable result and a shrug. Without it the
+run returned whatever text happened to be lying around, which after a round of
+pure tool calls is a dangling intent — a real one, from a pipeline step that hit
+the ceiling:
+
+```json
+{"status": "max_steps", "text": "Let me run a final integrity pass, then write
+ the corrections file."}
+```
+
+The status and exit code are unchanged (`max_steps`, 3): the task still did not
+finish on its own, and a driving script must still know that. Only the text
+improves. If the closing call itself fails the run falls back to the old text and
+logs `wrapup_error` rather than crashing.
+
+`--max-seconds` deliberately does *not* get this treatment. It is a promise about
+wall-clock time, and an extra request of unknown duration would break it, so a
+deadline stops where it stands.
 
 ## Thinking
 
@@ -707,15 +729,37 @@ keeps the recent tail verbatim.
 **Set `--context-tokens` to what the server actually serves, not what the model
 card claims.** With Ollama the ceiling is `num_ctx` (`OLLAMA_CONTEXT_LENGTH`, or
 `PARAMETER num_ctx` in the Modelfile), which is far below the model's advertised
-maximum by default. When a prompt exceeds it, Ollama silently drops the *front* of
-the prompt — the system prompt and tool definitions go first, and the agent starts
-behaving erratically with no error. Check with `ollama ps` on the server (the
-context size is listed per loaded model).
+maximum by default. The 32000 default is deliberately conservative.
+
+Find your real ceiling by asking for too much. A well-behaved endpoint names it:
+
+```
+prompt is 173419 tokens, which does not fit the 131072 token context
+of model "gemma4:31b-it-qat"
+```
+
+That is the good case — a loud 400 rather than silent damage. Some Ollama
+configurations instead drop the *front* of an oversize prompt, taking the system
+prompt and tool definitions with it, and the agent then misbehaves with no error
+at all. Worth knowing which yours does before raising the number: send a
+deliberately huge prompt once and see whether you get an error or a confused
+reply. `ollama ps` on the server also lists the context size per loaded model,
+when you have access to it.
+
+Then leave headroom. The reply shares the same window as the prompt, and the
+harness's own token count is an estimate. Against a 131072 ceiling, 96000 is
+comfortable — compaction triggers at 72k with ~35k spare.
+
+**Raising it is a trade.** Fewer compactions, but a slower first token on *every*
+request, because the server prefills the whole prompt before emitting anything.
+On a large local model a 70k-token prompt is a visible wait. If a session reads a
+lot of files and compacts constantly, a bigger window is the right fix; if it
+feels sluggish from the first message, the window is too big for the hardware.
 
 Token counting is estimated from characters, then calibrated against the
 `prompt_tokens` each response reports, so it converges on the server's real
-tokenizer after a request or two. `/context` shows the current estimate and the
-calibrated chars-per-token.
+tokenizer after a request or two. `/context` shows the current estimate, the
+calibrated chars-per-token, and which model writes the summaries.
 
 What survives a compaction:
 
@@ -732,6 +776,35 @@ the model just worked for. A single pasted message larger than the window is shr
 too, because the last message can never be dropped. A failed
 summary call degrades to dropping the old messages with a placeholder rather than
 overflowing the window.
+
+**Summaries use your main model.** `--summary-model` is opt-in only; point it at
+something cheaper and faster if compaction is the slow part of your sessions.
+`/context` tells you which one is in use.
+
+Compaction is the longest wait in the harness — it sends the whole dropped
+transcript and waits out the server's prefill before a single token comes back —
+so it reports as it goes:
+
+```
+⟳ compacting context (48206 tokens, 42 of 69 messages; keeping the newest 27)
+⟳ summarizing ~21400 tokens with gemma4:31b-it-qat · 47s 1203 chars written
+⟳ context compacted: 48206 → 14870 tokens (42 messages summarized, 27 kept)
+```
+
+The middle line rewrites in place on a terminal and is absent elsewhere; the
+seconds tick up during prefill, and the character count starts moving once the
+summary begins streaming. Ctrl-C works throughout. Every compaction also logs a
+`compaction_summary_done` event with its duration, input size and model, so you
+can see what it costs over a long session:
+
+```sh
+jq -r 'select(.type=="compaction_summary_done")
+       | "\(.seconds)s  \(.sent_tokens) tokens in  \(.model)"' logs/<id>.jsonl
+```
+
+If a compaction finishes still above the trigger it says so explicitly — that
+means the next turn will compact again immediately, and the window is too small
+for what the session is holding.
 
 ## Log format
 

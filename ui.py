@@ -7,6 +7,8 @@ import os
 import re
 import shutil
 import sys
+import threading
+import time
 from typing import Any
 
 
@@ -35,6 +37,9 @@ _VT = not os.getenv("NO_COLOR") and _enable_windows_vt()
 # harness's narration, and either one may be a terminal while the other is a file.
 _COLOR_OUT = sys.stdout.isatty() and _VT
 _COLOR_ERR = sys.stderr.isatty() and _VT
+# Rewriting a status line in place needs a terminal, but not colour: NO_COLOR
+# turns the colour off and the progress line should still work.
+_TTY_ERR = sys.stderr.isatty()
 _QUIET = False
 
 
@@ -194,6 +199,66 @@ def assistant_prefix() -> None:
         print(green("assistant"), end=" ", file=sys.stderr, flush=True)
     else:
         print("assistant", file=sys.stderr, flush=True)
+
+
+class Ticker:
+    """Keeps one status line alive while something slow happens.
+
+    A big request spends its first stretch in prefill, where the server has
+    accepted the prompt and is processing it: nothing streams back, so without
+    this the harness looks hung. The thread owns the writing; the main thread
+    only hands over a new detail string, so the two never interleave.
+    """
+
+    def __init__(self, label: str, interval: float = 0.5) -> None:
+        self.label = label
+        self.interval = interval
+        self.detail = ""
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._started = 0.0
+        # Rewriting a line needs a terminal. Elsewhere (a pipe, a cron log) the
+        # surrounding one-off messages are the progress report.
+        self._live = _TTY_ERR and not _QUIET
+
+    def start(self) -> None:
+        if self._thread or not self._live:
+            return
+        self._started = time.monotonic()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            elapsed = time.monotonic() - self._started
+            line = f"{self.label} {elapsed:.0f}s{self.detail}"
+            print(f"\r\033[K{dim(line)}", end="", file=sys.stderr, flush=True)
+            self._stop.wait(self.interval)
+
+    def set(self, detail: str) -> None:
+        """Replace the trailing detail, e.g. how much has arrived so far."""
+        self.detail = detail
+
+    def stop(self, clear: bool = True) -> None:
+        if not self._thread:
+            return
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        self._thread = None
+        if clear:
+            print("\r\033[K", end="", file=sys.stderr, flush=True)
+
+    @property
+    def elapsed(self) -> float:
+        return time.monotonic() - self._started if self._started else 0.0
+
+    def __enter__(self) -> Ticker:
+        self.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.stop()
 
 
 def narrate(chunk: str) -> None:

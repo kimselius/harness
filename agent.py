@@ -218,7 +218,10 @@ class Agent:
                            tokens=before)
             return False
 
-        ui.info(f"⟳ compacting context ({before} tokens, {len(head)} messages)…")
+        ui.info(
+            f"⟳ compacting context ({before} tokens, {len(head)} of "
+            f"{len(self.history)} messages; keeping the newest {len(tail)})"
+        )
         summary = self._summarize(head)
         if summary:
             self.history = [context.summary_message(summary), *tail]
@@ -243,6 +246,15 @@ class Agent:
             f"⟳ context compacted: {before} → {after} tokens "
             f"({len(head)} messages summarized, {len(tail)} kept)"
         )
+        if after >= self.cfg.compact_threshold:
+            # Compacting and landing back above the trigger means the next turn
+            # compacts again immediately. Say so: the window is too small for
+            # what this session is holding.
+            ui.warn(
+                f"! still at {after} tokens, over the {self.cfg.compact_threshold} "
+                "trigger — raise --context-tokens or lower --compact-keep, or the "
+                "next turn will compact again"
+            )
         return True
 
     def _summarize(self, head: list[dict[str, Any]]) -> str:
@@ -251,6 +263,21 @@ class Agent:
         # The summary request must itself fit the window.
         budget_chars = int(self.cfg.context_tokens * 0.5 * self.meter.chars_per_token)
         transcript, _ = truncate(transcript, budget_chars, 100_000)
+        sent = int(len(transcript) / self.meter.chars_per_token)
+        model = self.cfg.summary_model or self.cfg.model
+        # This is the longest unexplained pause in the harness: the server has to
+        # prefill the whole transcript before the first token of the summary comes
+        # back, which is minutes on a large local model. Show that it is alive.
+        ticker = ui.Ticker(f"⟳ summarizing ~{sent} tokens with {model} ·")
+        written = 0
+
+        def on_text(chunk: str) -> None:
+            nonlocal written
+            written += len(chunk)
+            ticker.set(f" {written} chars written")
+
+        ticker.start()
+        summary = ""
         try:
             reply = self.llm.complete(
                 [
@@ -258,15 +285,32 @@ class Agent:
                     {"role": "user", "content": transcript},
                 ],
                 tools=None,
+                on_text=on_text,
                 model=self.cfg.summary_model,
                 purpose="compaction",
                 effort=None,  # summarizing is mechanical; thinking is wasted here
             )
-            return reply.content.strip()
+            summary = reply.content.strip()
+            return summary
+        except KeyboardInterrupt:
+            ui.warn("! compaction interrupted")
+            raise
         except Exception as exc:
             ui.warn(f"! compaction summary failed: {type(exc).__name__}: {exc}")
             self.log.event("compaction_error", error=f"{type(exc).__name__}: {exc}")
             return ""
+        finally:
+            ticker.stop()
+            self.log.event(
+                "compaction_summary_done",
+                seconds=round(ticker.elapsed, 1),
+                sent_tokens=sent,
+                # The real size either way; `streamed_chars` is 0 with
+                # --no-stream, where there are no deltas to count.
+                summary_chars=len(summary),
+                streamed_chars=written,
+                model=model,
+            )
 
     def _trim_to_fit(self) -> None:
         """Force the kept history under the threshold.
@@ -408,18 +452,43 @@ class Agent:
 
             messages = self._messages()
             sent_chars = self.meter.request_chars(messages)
+            # Prefill is silent, and on a big prompt it is the longest wait in a
+            # turn. Tick until the first byte of the reply arrives, then get out
+            # of the way so the reply owns the line.
+            waiting = ui.Ticker(
+                f"⟳ thinking · step {step} · ~{self.used_tokens()} tokens sent ·"
+            )
+            waiting.start()
+
+            # Both the ticker and the printer are bound as defaults: they belong
+            # to this iteration, and a closure over the loop variable would see
+            # whatever the last iteration left behind.
+            def first_byte(chunk: str, feed=printer.feed, tick=waiting) -> None:
+                tick.stop()
+                feed(chunk)
+
+            def first_thought(
+                chunk: str, feed=printer.feed_reasoning, tick=waiting
+            ) -> None:
+                tick.stop()
+                feed(chunk)
+
             try:
                 reply = self.llm.complete(
                     messages,
                     toolkit.TOOL_SCHEMAS,
-                    on_text=printer.feed,
-                    on_reasoning=printer.feed_reasoning,
+                    on_text=first_byte,
+                    on_reasoning=first_thought,
                 )
             except KeyboardInterrupt:
                 # Interrupted while waiting for the model; nothing partial to keep.
                 printer.finish("")
                 self.note_interrupt("request")
                 return self._finish(INTERRUPTED, final_text, step, calls)
+            finally:
+                # Also covers the non-streaming path, where no chunk ever arrives
+                # to stop it, and any error on the way out.
+                waiting.stop()
             printer.finish(reply.content)
             self._note_reasoning(reply)
             self._warn_about_pasted_code(reply.content)
@@ -465,7 +534,59 @@ class Agent:
         self.history.append(
             {"role": "user", "content": step_limit_note(self.cfg.max_steps)}
         )
-        return self._finish(MAX_STEPS, final_text, step, calls)
+        return self._finish(MAX_STEPS, self._wrap_up(final_text), step, calls)
+
+    def _wrap_up(self, fallback: str) -> str:
+        """One tool-free turn, so a run that hit the ceiling still reports back.
+
+        Without this the turn ended on whatever text happened to be lying around,
+        which after a round of pure tool calls is often a dangling intent
+        ("Let me check one more thing…") or nothing at all — and that string is
+        what a driving script reads as the result. The note asking for a summary
+        was already being appended to the history and then never sent, so only a
+        human continuing the session ever saw it answered.
+
+        Tools are withheld rather than discouraged. That is what makes this
+        terminate: a model that is looping cannot loop one more time.
+        """
+        self.maybe_compact()  # the history is at its largest right now
+        printer = self._printer()
+        ticker = ui.Ticker("⟳ asking what it got done ·")
+        ticker.start()
+
+        def first(chunk: str, feed=printer.feed, tick=ticker) -> None:
+            tick.stop()
+            feed(chunk)
+
+        try:
+            reply = self.llm.complete(
+                self._messages(), tools=None, on_text=first, purpose="wrapup"
+            )
+        except KeyboardInterrupt:
+            printer.finish("")
+            self.note_interrupt("wrapup")
+            return fallback
+        except Exception as exc:
+            # A failed wrap-up must not turn a step-limit stop into a crash.
+            ui.warn(f"! could not get a closing summary: {type(exc).__name__}: {exc}")
+            self.log.event("wrapup_error", error=f"{type(exc).__name__}: {exc}")
+            return fallback
+        finally:
+            ticker.stop()
+
+        printer.finish(reply.content)
+        self._note_reasoning(reply)
+        self.session.add_usage(reply.usage, reply.reasoning_tokens)
+        if reply.usage:
+            self.last_usage = reply.usage
+        if reply.tool_calls:
+            # Some servers answer with tool calls even when none were offered.
+            # They are deliberately not run, so they must not be stored either:
+            # an unanswered tool_calls message is an invalid history.
+            self.log.event("wrapup_tool_calls_ignored",
+                           names=[c["name"] for c in reply.tool_calls])
+        self.history.append({"role": "assistant", "content": reply.content})
+        return reply.content.strip() or fallback
 
     def _past_deadline(self, started: float) -> bool:
         """Whether --max-seconds has run out. Checked between steps only.

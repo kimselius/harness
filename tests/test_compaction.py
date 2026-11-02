@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 import common  # noqa: E402
 import mock_server  # noqa: E402
-from common import check, make_agent, pairing_ok  # noqa: E402
+from common import check, make_agent, pairing_ok, records  # noqa: E402
 
 import context  # noqa: E402
 import tools as toolkit  # noqa: E402
@@ -246,6 +246,81 @@ def test_shrink_before_drop(tmp: Path, base_url: str) -> None:
     check("shrink logged", any(r["type"] == "message_shrunk" for r in recs))
 
 
+def test_progress_reporting(tmp: Path, base_url: str) -> None:
+    """Compaction is the longest silent wait in the harness; it has to report."""
+    print("compaction progress")
+    import ui
+
+    mock_server.reset()
+    mock_server.set_script([("a summary of the old messages", [])])
+    agent = common.make_agent(tmp / "progress", base_url,
+                              ["--context-tokens", "8000"])
+    agent.history = [{"role": "user", "content": f"task {i} " + "x" * 3000}
+                     for i in range(6)]
+    with common.capture() as cap:
+        agent.compact(reason="test")
+
+    check("says what it is compacting", "compacting context" in cap.err, cap.err)
+    check("says how much it is keeping", "keeping the newest" in cap.err, cap.err)
+    check("reports the result", "context compacted" in cap.err, cap.err)
+    check("progress stays off stdout", cap.out == "", repr(cap.out))
+
+    record = next(r for r in records(agent) if r["type"] == "compaction_summary_done")
+    check("timing logged", isinstance(record["seconds"], (int, float)))
+    check("input size logged", record["sent_tokens"] > 0, str(record["sent_tokens"]))
+    check("summary size logged", record["summary_chars"] > 0,
+          str(record["summary_chars"]))
+    check("nothing streamed without --stream", record["streamed_chars"] == 0,
+          str(record["streamed_chars"]))
+    check("names the model it used", record["model"] == agent.cfg.model,
+          str(record["model"]))
+
+    # Streaming is where the live char count comes from.
+    mock_server.reset()
+    mock_server.set_script([("a streamed summary of the old messages", [])])
+    streamed = common.make_agent(tmp / "progress-stream", base_url,
+                                 ["--context-tokens", "8000"], stream=True)
+    streamed.history = [{"role": "user", "content": f"task {i} " + "x" * 3000}
+                        for i in range(6)]
+    with common.capture():
+        streamed.compact(reason="test")
+    live = next(r for r in records(streamed)
+                if r["type"] == "compaction_summary_done")
+    check("streamed chars counted", live["streamed_chars"] > 0,
+          str(live["streamed_chars"]))
+    check("streamed count matches the summary",
+          live["streamed_chars"] >= live["summary_chars"] > 0,
+          f"{live['streamed_chars']} vs {live['summary_chars']}")
+
+    # The Ticker must be inert when stderr is not a terminal, or a cron log fills
+    # up with half-rewritten status lines.
+    ticker = ui.Ticker("test")
+    ticker.start()
+    ticker.set(" detail")
+    ticker.stop()
+    check("ticker is silent off a terminal", not ticker._live)
+    check("ticker survives stop without start", ui.Ticker("x").stop() is None)
+
+
+def test_warns_when_compaction_did_not_help(tmp: Path, base_url: str) -> None:
+    """Landing back over the trigger means it will fire again next turn."""
+    print("compaction that does not help")
+    mock_server.reset()
+    mock_server.set_script([("tiny", [])])
+    agent = common.make_agent(tmp / "nohelp", base_url, ["--context-tokens", "4000"])
+    # One message too big to drop and too big to fit: the tail must stay.
+    agent.history = [{"role": "user", "content": "keep " * 400},
+                     {"role": "user", "content": "huge " * 4000}]
+    with common.capture() as cap:
+        agent.compact(reason="test")
+    if agent.used_tokens() >= agent.cfg.compact_threshold:
+        check("warns it is still over the trigger",
+              "still at" in cap.err and "compact again" in cap.err, cap.err)
+    else:
+        check("got under the trigger, so no warning",
+              "still at" not in cap.err, cap.err)
+
+
 def main() -> int:
     server, base_url = mock_server.start()
     with tempfile.TemporaryDirectory() as raw:
@@ -259,6 +334,8 @@ def main() -> int:
         test_disabled(tmp, base_url)
         test_trim_guard(tmp, base_url)
         test_shrink_before_drop(tmp, base_url)
+        test_progress_reporting(tmp, base_url)
+        test_warns_when_compaction_did_not_help(tmp, base_url)
     server.shutdown()
     return common.report()
 

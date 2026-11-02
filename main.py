@@ -295,6 +295,14 @@ def cmd_context(agent: Agent, rest: str) -> None:
             else " (estimate)"
         )
     )
+    ui.info(
+        "summaries: "
+        + (
+            f"{cfg.summary_model} (--summary-model)"
+            if cfg.summary_model
+            else f"{cfg.model}, the same model (--summary-model to change)"
+        )
+    )
     ui.info(f"session total: {agent.session.totals_line()}")
 
 

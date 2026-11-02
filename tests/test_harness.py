@@ -279,6 +279,112 @@ def test_commands(tmp: Path, base_url: str) -> None:
     check("/exit stops", handle_command("/exit", agent) is False)
 
 
+def test_step_limit_wraps_up(tmp: Path, base_url: str) -> None:
+    """Running out of tool rounds must still produce a usable answer.
+
+    It used to return whatever text was lying around — after a round of pure
+    tool calls, a dangling intent or nothing — and that string is what a driving
+    script reads as the result.
+    """
+    print("step limit wrap-up")
+    import mock_server as mock
+
+    from agent import MAX_STEPS
+
+    mock.reset()
+    # Two tool-calling turns, then the answer the wrap-up call will receive.
+    mock.set_script([
+        ("", [("shell", {"command": "echo one"})]),
+        ("", [("shell", {"command": "echo two"})]),
+        ("I wrote a.txt and b.txt. The migration is still unwritten.", []),
+    ])
+    agent = common.make_agent(tmp / "wrap", base_url, ["--max-steps", "2"])
+    final = agent.run("do a long job")
+
+    check("the closing summary is the result",
+          final == "I wrote a.txt and b.txt. The migration is still unwritten.",
+          repr(final))
+    check("status still reports the limit", agent.outcome.status == MAX_STEPS,
+          agent.outcome.status)
+    check("and the text matches", agent.outcome.text == final)
+    check("tool rounds counted, not the wrap-up", agent.outcome.steps == 2,
+          str(agent.outcome.steps))
+    check("history stays valid", common.pairing_ok(agent.history))
+
+    # The wrap-up must not be able to call tools — that is what ends the loop.
+    wrapup = [r for r in common.records(agent)
+              if r["type"] == "llm_request" and r.get("purpose") == "wrapup"]
+    check("exactly one wrap-up request", len(wrapup) == 1, str(len(wrapup)))
+    check("it offered no tools", not wrapup[0]["tool_names"],
+          str(wrapup[0]["tool_names"]))
+    check("the limit note was actually sent",
+          any("Step limit" in (m.get("content") or "")
+              for m in wrapup[0]["messages"]),
+          "note missing from the wrap-up request")
+    check("the summary is in history for a resume",
+          agent.history[-1]["role"] == "assistant"
+          and "migration" in agent.history[-1]["content"],
+          str(agent.history[-1])[:120])
+
+
+def test_wrap_up_discards_tool_calls(tmp: Path, base_url: str) -> None:
+    """A server may return tool calls even when none were offered."""
+    print("wrap-up with unsolicited tool calls")
+    import mock_server as mock
+
+    mock.reset()
+    # One entry, so it repeats: the wrap-up gets tool calls too.
+    mock.set_script([("still going", [("shell", {"command": "echo loop"})])])
+    agent = common.make_agent(tmp / "wrap-calls", base_url, ["--max-steps", "1"])
+    agent.run("loop forever")
+
+    check("no unanswered tool call left behind", common.pairing_ok(agent.history))
+    check("the ignored calls are logged",
+          any(r["type"] == "wrapup_tool_calls_ignored"
+              for r in common.records(agent)))
+    check("nothing extra was executed", sum(
+        1 for r in common.records(agent) if r["type"] == "tool_call") == 1)
+
+    # The real test of a valid history: the next turn must work.
+    mock.set_script([("second turn fine", [])])
+    check("the session still works afterwards",
+          agent.run("anything else?") == "second turn fine")
+
+
+def test_wrap_up_failure_is_survivable(tmp: Path, base_url: str) -> None:
+    """A failed closing call must not turn a step-limit stop into a crash."""
+    print("wrap-up that fails")
+    import mock_server as mock
+
+    from agent import MAX_STEPS
+
+    mock.reset()
+    mock.set_script([("partial progress", [("shell", {"command": "echo x"})])])
+    agent = common.make_agent(tmp / "wrap-fail", base_url, ["--max-steps", "1"])
+
+    # Fail only the closing call. Setting mock_server.FAIL_NEXT would break the
+    # first request instead, which is a different path entirely.
+    real = agent.llm.complete
+
+    def flaky(*args, **kwargs):
+        if kwargs.get("purpose") == "wrapup":
+            raise RuntimeError("endpoint exploded")
+        return real(*args, **kwargs)
+
+    agent.llm.complete = flaky
+    with common.capture() as cap:
+        final = agent.run("do a long job")
+    agent.llm.complete = real
+
+    check("no crash", agent.outcome.status == MAX_STEPS, agent.outcome.status)
+    check("falls back to the last real text", final == "partial progress",
+          repr(final))
+    check("says it could not summarize", "closing summary" in cap.err, cap.err[-200:])
+    check("the failure is logged",
+          any(r["type"] == "wrapup_error" for r in common.records(agent)))
+    check("history still valid", common.pairing_ok(agent.history))
+
+
 def main() -> int:
     server, base_url = mock_server.start()
     with tempfile.TemporaryDirectory() as raw:
@@ -294,6 +400,9 @@ def main() -> int:
         test_session_state(tmp, base_url)
         test_completion(tmp, base_url)
         test_commands(tmp, base_url)
+        test_step_limit_wraps_up(tmp, base_url)
+        test_wrap_up_discards_tool_calls(tmp, base_url)
+        test_wrap_up_failure_is_survivable(tmp, base_url)
     server.shutdown()
     return common.report()
 

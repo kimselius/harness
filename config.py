@@ -367,8 +367,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=_env_int("HARNESS_CONTEXT_TOKENS", 32000),
         help=(
-            "Usable context window in tokens. Must fit what the server actually "
-            "serves (e.g. ollama's num_ctx), not the model's advertised maximum."
+            "Usable context window in tokens (default 32000, deliberately "
+            "conservative). Set it to what the server actually serves, not the "
+            "model's advertised maximum: with ollama that is num_ctx / "
+            "OLLAMA_CONTEXT_LENGTH. Leave room for the reply, since output "
+            "shares the same window. Raising this means fewer compactions but a "
+            "slower first token on every request, because the server prefills "
+            "the whole prompt."
         ),
     )
     p.add_argument(

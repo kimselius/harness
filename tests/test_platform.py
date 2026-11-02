@@ -139,6 +139,58 @@ def test_colour_detection() -> None:
           "\033" not in ui.dim("x") if not ui.colors_enabled() else True)
 
 
+def test_ticker_on_a_real_terminal() -> None:
+    """The progress line only exists on a terminal, so test it on one.
+
+    Off a terminal ui.Ticker is inert (checked in test_compaction); here a pty
+    makes stderr a tty at import time so the rewriting path actually runs.
+    """
+    print("progress ticker under a pty")
+    import os
+    import pty
+    import time
+
+    pid, fd = pty.fork()
+    if pid == 0:  # child: stderr is the pty
+        try:
+            import importlib
+
+            import ui as child_ui
+
+            importlib.reload(child_ui)  # re-evaluate isatty() for the pty
+            ticker = child_ui.Ticker("⟳ summarizing ·", interval=0.05)
+            ticker.start()
+            time.sleep(0.2)
+            ticker.set(" 128 chars written")
+            time.sleep(0.2)
+            ticker.stop()
+            print("DONE", file=sys.stderr, flush=True)
+        finally:
+            os._exit(0)
+
+    chunks = b""
+    deadline = time.time() + 15
+    while time.time() < deadline and b"DONE" not in chunks:
+        try:
+            data = os.read(fd, 4096)
+        except OSError:
+            break
+        if not data:
+            break
+        chunks += data
+    os.waitpid(pid, 0)
+    os.close(fd)
+    text = chunks.decode(errors="replace")
+
+    check("rewrites one line in place", text.count("\r\033[K") >= 2,
+          str(text.count("\r\033[K")))
+    check("shows elapsed time", "0s" in text or "1s" in text, repr(text[:120]))
+    check("shows the detail it was given", "128 chars written" in text,
+          repr(text[-120:]))
+    check("clears the line when it stops", text.rstrip().endswith("DONE"),
+          repr(text[-60:]))
+
+
 def main_() -> int:
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
@@ -147,6 +199,7 @@ def main_() -> int:
         test_probe_is_posix_only(tmp)
         test_queue_survives_unwatchable_stdin()
         test_colour_detection()
+        test_ticker_on_a_real_terminal()
     return common.report()
 
 
