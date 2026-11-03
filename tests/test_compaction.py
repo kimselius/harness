@@ -120,9 +120,15 @@ def test_compaction_runs(tmp: Path, base_url: str) -> None:
     check("compaction triggered", did)
     check("under threshold after", after < agent.cfg.compact_threshold,
           f"{before} -> {after}")
-    check("summary message first", agent.history[0]["content"].startswith(
-        context.SUMMARY_HEADER))
-    check("summary content kept", "did stuff" in agent.history[0]["content"])
+    # The shape is [original request, summary, recent tail]: the job statement
+    # itself must never be replaced by a paraphrase of it.
+    check("the opening request is pinned verbatim",
+          agent.history[0]["content"] == "task 0", repr(agent.history[0]["content"]))
+    check("summary follows it", agent.history[1]["content"].startswith(
+        context.SUMMARY_HEADER), repr(agent.history[1]["content"][:80]))
+    check("summary content kept", "did stuff" in agent.history[1]["content"])
+    check("summary says not to start over",
+          "not start the task over" in agent.history[1]["content"])
     check("recent history kept", any("task 11" in (m.get("content") or "")
                                      for m in agent.history))
     check("pairing intact", pairing_ok(agent.history))
@@ -178,7 +184,12 @@ def test_summary_failure(tmp: Path, base_url: str) -> None:
     agent.history = bulk_history(12)
     did = agent.compact(reason="test")
     check("still compacts", did)
-    check("placeholder inserted", "summary unavailable" in agent.history[0]["content"])
+    check("placeholder inserted",
+          any("summary unavailable" in (m.get("content") or "")
+              for m in agent.history[:2]),
+          str(agent.history[:2])[:160])
+    check("the request is still pinned even when summarizing failed",
+          agent.history[0]["content"] == "task 0", repr(agent.history[0]["content"]))
     check("under threshold", agent.used_tokens() < agent.cfg.compact_threshold)
     check("pairing intact", pairing_ok(agent.history))
     mock_server.FAIL_NEXT.clear()
@@ -208,9 +219,10 @@ def test_trim_guard(tmp: Path, base_url: str) -> None:
     check("trimmed under threshold",
           agent.used_tokens() < agent.cfg.compact_threshold, str(agent.used_tokens()))
     check("summary survived trim",
-          agent.history[0]["content"].startswith(context.SUMMARY_HEADER))
+          any((m.get("content") or "").startswith(context.SUMMARY_HEADER)
+              for m in agent.history[:2]), str(agent.history[:2])[:160])
     check("the oversized message was shrunk, not dropped",
-          any((m.get("content") or "").startswith("huge ") for m in agent.history[1:]))
+          any((m.get("content") or "").startswith("huge ") for m in agent.history[2:]))
     check("pairing intact", pairing_ok(agent.history))
     recs = [json.loads(l) for l in agent.cfg.log_path.read_text().splitlines()]
     check("shrink logged", any(r["type"] == "message_shrunk" for r in recs))
@@ -244,6 +256,67 @@ def test_shrink_before_drop(tmp: Path, base_url: str) -> None:
     check("pairing intact", pairing_ok(agent.history))
     recs = [json.loads(l) for l in agent.cfg.log_path.read_text().splitlines()]
     check("shrink logged", any(r["type"] == "message_shrunk" for r in recs))
+
+
+def test_task_survives_compaction(tmp: Path, base_url: str) -> None:
+    """The reported failure: a part-done job restarted itself after compacting.
+
+    The authoritative statement of the work was in the summarized half, so it
+    was replaced by a paraphrase and the agent re-derived a different task.
+    """
+    print("the task itself survives")
+    mock_server.reset()
+    mock_server.set_script([("items 1-14 of 19 done, 15 next", [])])
+    agent = make_agent(tmp / "pin", base_url, ["--context-tokens", "20000"])
+    task = ("Process all 19 items listed in items.txt. For each, read it, "
+            "transform it, and append the result to out/<n>.md. Strictly in order.")
+    agent.history = [{"role": "user", "content": task}]
+    for n in range(1, 15):
+        agent.history.append({"role": "assistant", "content": f"Item {n} done."})
+        agent.history.append({"role": "user", "content": "noise " + "x" * 2000})
+
+    agent.compact(reason="test")
+
+    check("the request is kept word for word",
+          any(task == (m.get("content") or "") for m in agent.history),
+          "the task statement did not survive")
+    check("it comes first", agent.history[0]["content"] == task,
+          agent.history[0]["content"][:60])
+    check("exactly one copy of it",
+          sum(1 for m in agent.history if (m.get("content") or "") == task) == 1)
+    check("the summary is marked as history, not a request",
+          context.SUMMARY_GUIDANCE in agent.history[1]["content"])
+    check("recent work still verbatim",
+          any("Item 14 done." == (m.get("content") or "") for m in agent.history))
+    check("it did get smaller", agent.used_tokens() < 20000 * 0.75,
+          str(agent.used_tokens()))
+
+    # A second compaction must not drop it either, or a long run loses the task
+    # on the round after next.
+    mock_server.set_script([("still going", [])])
+    for n in range(15, 19):
+        agent.history.append({"role": "assistant", "content": f"Item {n} done."})
+        agent.history.append({"role": "user", "content": "noise " + "x" * 2000})
+    agent.compact(reason="test")
+    check("survives a second compaction", agent.history[0]["content"] == task,
+          agent.history[0]["content"][:60])
+    check("still only one copy",
+          sum(1 for m in agent.history if (m.get("content") or "") == task) == 1)
+
+    # An enormous pasted brief is capped rather than reclaiming the window.
+    mock_server.set_script([("ok", [])])
+    big = make_agent(tmp / "pin-big", base_url, ["--context-tokens", "8000"])
+    huge = "BRIEF: " + "requirement " * 8000
+    big.history = [{"role": "user", "content": huge}]
+    big.history += [{"role": "user", "content": "noise " + "y" * 2000}
+                    for _ in range(8)]
+    big.compact(reason="test")
+    first = big.history[0]["content"]
+    check("a huge brief is kept but capped",
+          first.startswith("BRIEF: ") and len(first) < len(huge),
+          f"{len(first)} of {len(huge)}")
+    check("the cap is recorded",
+          any(r["type"] == "pinned_task_truncated" for r in records(big)))
 
 
 def test_progress_reporting(tmp: Path, base_url: str) -> None:
@@ -334,6 +407,7 @@ def main() -> int:
         test_disabled(tmp, base_url)
         test_trim_guard(tmp, base_url)
         test_shrink_before_drop(tmp, base_url)
+        test_task_survives_compaction(tmp, base_url)
         test_progress_reporting(tmp, base_url)
         test_warns_when_compaction_did_not_help(tmp, base_url)
     server.shutdown()

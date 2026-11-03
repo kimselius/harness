@@ -204,8 +204,22 @@ def load_history(
                 and len(history) == kept + summarized
             ):
                 summary = record.get("summary") or context.SUMMARY_FALLBACK
-                tail = history[len(history) - kept :] if kept else []
-                history = [context.summary_message(summary), *tail]
+                cut = len(history) - kept
+                tail = history[cut:] if kept else []
+                # Same shape the live compaction produced, or a resumed session
+                # would be missing the pinned request the original had. Prefer the
+                # recorded copy: the live one is size-capped, so re-deriving it
+                # here would not match. Older logs have no such field.
+                pinned_text = record.get("pinned_task")
+                if pinned_text:
+                    pinned = {"role": "user", "content": pinned_text}
+                else:
+                    pinned = context.first_task(history[:cut])
+                history = [
+                    *([pinned] if pinned else []),
+                    context.summary_message(summary),
+                    *tail,
+                ]
                 stats["compactions_applied"] += 1
             else:
                 # Counts do not line up with the replay (an older log, or trimming

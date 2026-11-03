@@ -19,22 +19,43 @@ MAX_CHARS_PER_TOKEN = 8.0
 RENDER_TOOL_CHARS = 800
 
 SUMMARY_SYSTEM = """\
-You compact an agent transcript so work can continue with a shorter context.
+You are writing a progress record so an agent can carry on exactly where it left
+off, with the earlier transcript gone.
 
-Write a dense handoff note, no preamble, no pleasantries. Cover, in this order and
-only where applicable:
-1. The user's goal and any explicit instructions or constraints they gave.
-2. What has been done so far, including commands run and their outcomes.
-3. Files created or modified, with their paths and current state.
-4. Facts discovered about the environment that would be expensive to rediscover
-   (versions, paths, config values, error messages, credentials locations).
-5. What is still open: the next step, and anything known to be broken.
+The user's original request is preserved separately, word for word, and the agent
+will see it. So do not restate the goal, do not rewrite the instructions, and never
+phrase anything as a new instruction — you are describing the past, not assigning
+work. An agent reading your note must not conclude that it should start over.
+
+Write a dense record, no preamble, no pleasantries. Cover, in this order and only
+where applicable:
+
+1. Progress. If the work has discrete parts — a list, a queue, numbered steps,
+   files to process — say exactly which are finished and which are not, by their
+   own names or numbers, and where the sequence stopped. Be specific: "items 1-14
+   of 19 done, item 15 (foo.csv) in progress, 16-19 untouched", never "most items
+   are done". This is the single most important thing in the note.
+2. Files created or modified, with their exact paths and current state.
+3. Commands that were run and what they returned, where the outcome still matters.
+4. Facts discovered that would be expensive to rediscover: versions, paths, config
+   values, error messages, where credentials live.
+5. What is still open: the immediate next action, and anything known to be broken
+   or already tried and failed, so it is not attempted again.
 
 Preserve exact paths, names, flags and numbers. Drop conversational filler and
 superseded intermediate attempts. Prefer short lines over prose.
 """
 
-SUMMARY_HEADER = "[context summary of the earlier part of this session]"
+SUMMARY_HEADER = "[harness] Record of earlier work in this session."
+
+# Spelled out in the message itself rather than left to the model's judgement: a
+# summary sitting in the user role reads like a fresh request, and an agent that
+# reads it that way starts the whole task again.
+SUMMARY_GUIDANCE = (
+    "This is history written by the harness, not a new request. Do not start the "
+    "task over, and do not redo anything recorded below as already done — carry on "
+    "from what is still open."
+)
 
 # Used when the summary call itself fails: better to drop the old messages with a
 # marker than to overflow the window.
@@ -164,4 +185,29 @@ def render_transcript(
 
 def summary_message(text: str) -> dict[str, Any]:
     """The replacement message that stands in for everything summarized."""
-    return {"role": "user", "content": f"{SUMMARY_HEADER}\n{text.strip()}"}
+    return {
+        "role": "user",
+        "content": f"{SUMMARY_HEADER}\n{SUMMARY_GUIDANCE}\n\n{text.strip()}",
+    }
+
+
+# Messages the harness wrote itself. They are context, never the user's request.
+HARNESS_PREFIXES = ("[harness]", "<state>", SUMMARY_HEADER)
+
+
+def first_task(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The user's own opening request, if there is one in `messages`.
+
+    Compaction keeps this verbatim. Summarizing it away was losing the
+    authoritative statement of the job — the only copy of "all 19 items, in
+    order" — leaving the agent to re-derive the task from a paraphrase, which is
+    how a half-finished run turns into a different run.
+    """
+    for message in messages:
+        if message.get("role") != "user":
+            continue
+        content = message.get("content") or ""
+        if content.startswith(HARNESS_PREFIXES) or not content.strip():
+            continue
+        return message
+    return None

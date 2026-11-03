@@ -222,12 +222,12 @@ class Agent:
             f"⟳ compacting context ({before} tokens, {len(head)} of "
             f"{len(self.history)} messages; keeping the newest {len(tail)})"
         )
+        # The opening request is pinned verbatim ahead of the summary. Everything
+        # else about the past is a paraphrase; the job itself must not be.
+        pinned = self._pin_task(head)
         summary = self._summarize(head)
-        if summary:
-            self.history = [context.summary_message(summary), *tail]
-        else:
-            # Summarizing failed; drop the head rather than overflow the window.
-            self.history = [context.summary_message(SUMMARY_FALLBACK), *tail]
+        replacement = context.summary_message(summary or SUMMARY_FALLBACK)
+        self.history = [*([pinned] if pinned else []), replacement, *tail]
 
         self._trim_to_fit()
         after = self.used_tokens()
@@ -241,6 +241,9 @@ class Agent:
             messages_kept=len(tail),
             chars_per_token=round(self.meter.chars_per_token, 2),
             summary=summary or "",
+            # Recorded verbatim so a replay rebuilds the identical history: the
+            # pinned copy is capped, and re-deriving it would use a different cap.
+            pinned_task=pinned["content"] if pinned else None,
         )
         ui.info(
             f"⟳ context compacted: {before} → {after} tokens "
@@ -256,6 +259,24 @@ class Agent:
                 "next turn will compact again"
             )
         return True
+
+    def _pin_task(self, head: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Copy of the user's opening request, to survive this compaction.
+
+        Capped, because a huge pasted brief must not claim the whole window back
+        on every compaction. The cap is generous: losing the end of the request is
+        still worse than losing a few recent messages.
+        """
+        task = context.first_task(head)
+        if task is None:
+            return None
+        budget = max(500, self.cfg.compact_keep_tokens // 3)
+        text, note = truncate(
+            task["content"], int(budget * self.meter.chars_per_token), 10**9
+        )
+        if note:
+            self.log.event("pinned_task_truncated", chars=len(text))
+        return {"role": "user", "content": text}
 
     def _summarize(self, head: list[dict[str, Any]]) -> str:
         """Ask the model for a handoff note covering the messages being dropped."""

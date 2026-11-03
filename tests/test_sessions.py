@@ -150,9 +150,17 @@ def test_replay_honours_compaction(tmp: Path, base_url: str) -> None:
     check("compaction applied", stats["compactions_applied"] == 1, str(stats))
     check("same length as live history", len(history) == compacted,
           f"{len(history)} vs {compacted}")
-    check("starts with the summary",
-          history[0]["content"].startswith(context.SUMMARY_HEADER), history[0]["content"][:40])
-    check("summary text kept", "a summary of earlier work" in history[0]["content"])
+    # Replay must rebuild the same shape the live compaction produced, pinned
+    # request included — otherwise a resumed run sees a different task.
+    check("starts with the pinned request",
+          history[0]["content"].startswith("task 0"), history[0]["content"][:40])
+    check("summary follows it",
+          history[1]["content"].startswith(context.SUMMARY_HEADER),
+          history[1]["content"][:40])
+    check("summary text kept", "a summary of earlier work" in history[1]["content"])
+    check("matches the live history exactly",
+          [m["content"] for m in history] == [m["content"] for m in agent.history],
+          f"replayed {len(history)} vs live {len(agent.history)}")
     check("tail kept verbatim", history[-1]["content"].startswith("task 5"),
           history[-1]["content"][:20])
 

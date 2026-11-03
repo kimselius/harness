@@ -748,7 +748,19 @@ when you have access to it.
 
 Then leave headroom. The reply shares the same window as the prompt, and the
 harness's own token count is an estimate. Against a 131072 ceiling, 96000 is
-comfortable — compaction triggers at 72k with ~35k spare.
+comfortable — compaction triggers at 72k with ~35k spare. Setting it *at* the
+ceiling (128000 against 131072) leaves nothing for the reply or for estimate
+drift, and a single overshoot is a failed turn.
+
+**`--compact-keep` is the other half of the decision.** At the 0.25 default,
+compacting at 75% throws away roughly two thirds of the context in one go, then
+refills. That is a lot of recent work to convert into prose at once. For a job
+with many steps, 0.4–0.5 keeps more of the actual work verbatim and loses less
+per compaction, at the cost of compacting more often:
+
+```sh
+main.py --context-tokens 96000 --compact-at 0.75 --compact-keep 0.45
+```
 
 **Raising it is a trade.** Fewer compactions, but a slower first token on *every*
 request, because the server prefills the whole prompt before emitting anything.
@@ -764,9 +776,31 @@ calibrated chars-per-token, and which model writes the summaries.
 What survives a compaction:
 
 1. The system prompt (always rebuilt from `PROMPT.md`).
-2. A summary message covering everything dropped: the goal and instructions, work
-   done, files touched, environment facts, and what is still open.
-3. The most recent `--compact-keep` worth of messages, verbatim.
+2. **Your opening request, verbatim.** Not a paraphrase of it.
+3. A summary of everything else dropped: progress so far, files touched,
+   environment facts, and what is still open.
+4. The most recent `--compact-keep` worth of messages, verbatim.
+
+Point 2 exists because of a specific failure. A run working through 19 items,
+14 done, compacted — and started over doing different work. The reason: the
+message stating the job ("all 19 items, strictly in order, append to `out/<n>.md`")
+was in the half being summarized, so the only surviving copy was the summarizer's
+paraphrase. The agent re-derived the task from prose and got a different task.
+
+Three things changed:
+
+- The opening request is now pinned ahead of the summary and kept word for word
+  through every compaction, however many there are. A very large pasted brief is
+  capped rather than reclaiming the window each time.
+- The summary carries an explicit instruction not to start over. A summary sits in
+  the `user` role, where instructions come from, so "the goal is X, still open: Y"
+  reads like a fresh request unless it says otherwise.
+- The summary prompt demands exact progress accounting — "items 1-14 of 19 done,
+  15 in progress, 16-19 untouched", never "most items are done" — because that
+  enumeration is what tells the agent not to redo work.
+
+If a session resumes, replay rebuilds exactly this shape from the log, pinned
+request included, so a resumed run sees the same task the original did.
 
 Split points never separate an assistant `tool_calls` message from its results, so
 the history stays valid for strict APIs. If the kept tail still doesn't fit, the
