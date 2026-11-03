@@ -44,6 +44,56 @@ class Outcome:
         return self.status == OK
 
 
+class _Progress:
+    """Status line for the silent stretches of a request.
+
+    Three things happen with nothing on screen: prefill, hidden reasoning, and
+    assembling a tool call whose arguments can be tens of thousands of
+    characters. This keeps one line alive through all of them, and steps aside
+    the moment the reply itself starts printing.
+    """
+
+    # Below this, a tool call is assembled faster than it is worth drawing.
+    MIN_ARG_CHARS = 400
+
+    def __init__(self, ticker: Any, printer: _Printer, show_thinking: bool) -> None:
+        self.ticker = ticker
+        self.printer = printer
+        self.show_thinking = show_thinking
+        self.reasoning_chars = 0
+
+    def text(self, chunk: str) -> None:
+        self.ticker.stop()  # the reply owns the line from here
+        self.printer.feed(chunk)
+
+    def reasoning(self, chunk: str) -> None:
+        if self.show_thinking:
+            self.ticker.stop()
+            self.printer.feed_reasoning(chunk)
+            return
+        # Hidden thinking is still thinking. Keep the clock running and show it
+        # growing, or a long reasoning phase is indistinguishable from a hang.
+        self.reasoning_chars += len(chunk)
+        self.ticker.show("⟳ thinking ·", f" {self.reasoning_chars} chars so far")
+
+    def tool_args(self, name: str, chars: int) -> None:
+        # Only resume at a line boundary: the status line rewrites whatever line
+        # it is on, and half-written prose must not be clobbered.
+        if chars < self.MIN_ARG_CHARS or not self.printer.at_line_start:
+            return
+        self.ticker.show(
+            f"⟳ {name or 'tool call'} ·", f" {chars} chars of arguments"
+        )
+
+
+def _tool_label(name: str, args: dict[str, Any]) -> str:
+    """What to call a running tool on the status line."""
+    if name == "shell":
+        return str(args.get("command") or name)
+    path = args.get("path")
+    return f"{name} {path}" if path else name
+
+
 class _Printer:
     """Prints an assistant reply, streamed or whole, with optional markdown.
 
@@ -60,6 +110,9 @@ class _Printer:
             markdown.StreamRenderer(self._write, style=style) if markdown_on else None
         )
         self.started = False
+        # Whether the cursor is at the start of a line. A status line rewrites
+        # whatever line it is on, so it must not resume over half-written prose.
+        self.at_line_start = True
 
     def _write(self, text: str) -> None:
         # Nothing opens the reply with blank lines, so a leading run of them is
@@ -71,6 +124,7 @@ class _Printer:
             ui.assistant_prefix()
             self.started = True
         print(text, end="", flush=True)
+        self.at_line_start = text.endswith("\n")
 
     def feed_reasoning(self, chunk: str) -> None:
         """Streamed reasoning text. Hidden unless asked for, never in history.
@@ -473,33 +527,21 @@ class Agent:
 
             messages = self._messages()
             sent_chars = self.meter.request_chars(messages)
-            # Prefill is silent, and on a big prompt it is the longest wait in a
-            # turn. Tick until the first byte of the reply arrives, then get out
-            # of the way so the reply owns the line.
-            waiting = ui.Ticker(
-                f"⟳ thinking · step {step} · ~{self.used_tokens()} tokens sent ·"
-            )
+            # Everything a request does before prose appears is silent: prefill,
+            # hidden reasoning, and assembling a tool call whose arguments can be
+            # tens of thousands of characters. The ticker covers all of it and
+            # only gets out of the way when the reply itself starts printing.
+            waiting = ui.Ticker(f"⟳ step {step} · ~{self.used_tokens()} tokens sent ·")
             waiting.start()
-
-            # Both the ticker and the printer are bound as defaults: they belong
-            # to this iteration, and a closure over the loop variable would see
-            # whatever the last iteration left behind.
-            def first_byte(chunk: str, feed=printer.feed, tick=waiting) -> None:
-                tick.stop()
-                feed(chunk)
-
-            def first_thought(
-                chunk: str, feed=printer.feed_reasoning, tick=waiting
-            ) -> None:
-                tick.stop()
-                feed(chunk)
+            progress = _Progress(waiting, printer, self.cfg.show_thinking)
 
             try:
                 reply = self.llm.complete(
                     messages,
                     toolkit.TOOL_SCHEMAS,
-                    on_text=first_byte,
-                    on_reasoning=first_thought,
+                    on_text=progress.text,
+                    on_reasoning=progress.reasoning,
+                    on_tool_args=progress.tool_args,
                 )
             except KeyboardInterrupt:
                 # Interrupted while waiting for the model; nothing partial to keep.
@@ -645,6 +687,11 @@ class Agent:
                 "tool_call", step=step, id=call["id"], name=name, arguments=args
             )
             started = time.monotonic()
+            # A command produces nothing until it exits, so without this a long
+            # build is indistinguishable from a hang. Not a substitute for
+            # streaming the output, but it does show the thing is alive.
+            running = ui.Ticker(f"  ⎿ {ui.one_line(_tool_label(name, args), 60)} ·")
+            running.start()
             try:
                 result, is_error = toolkit.execute(name, args, self.cfg, self.session), False
             except ToolError as exc:
@@ -658,6 +705,8 @@ class Agent:
                 result, is_error = "ERROR: interrupted by user", True
             except Exception as exc:  # keep the session alive on tool bugs
                 result, is_error = f"ERROR: {type(exc).__name__}: {exc}", True
+            finally:
+                running.stop()
             elapsed = time.monotonic() - started
         else:
             ui.tool_call(name, {"raw_arguments": raw_args})

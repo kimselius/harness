@@ -14,7 +14,7 @@ file paths to a workspace directory. Do not point it at a machine you care about
 | REPL, sessions, compaction, logging | yes | yes | yes |
 | Prompt wrapping / line editing | GNU readline | libedit | plain console, or pyreadline3 |
 | Colour | yes | yes | VT enabled at startup, else colour off |
-| Paste kept as one message | yes | yes | no, one line per message |
+| Paste held for review, sent on Enter | yes | yes | no, one line per message |
 | Typing while it works | yes | yes | no, wait for the prompt |
 | `shell` tool | `/bin/sh -c` | `/bin/sh -c` | `cmd.exe`, POSIX syntax will not work |
 | Persistent shell directory | yes | yes | no, stays at the workspace root |
@@ -353,12 +353,42 @@ markers are only used with a line editor known to understand them — CPython's 
 unrecognised editor such as pyreadline3 gets the prompt untouched, since it would
 print the markers as literal control characters.
 
-Paste freely: a multi-line paste is kept together as one message rather than being
-chopped into one message per line. `input()` returns at the first newline, so the
-harness drains whatever the terminal still has buffered and reassembles it, which
-also normalizes CRLF and strips bracketed-paste markers. A paste that ends mid-line
-waits for you to press Enter. To type a multi-line message by hand, start with `<<<`
-and end with `>>>` on its own line.
+### Pasting
+
+A multi-line paste is kept together as one message, and **held until you press
+Enter**:
+
+```
+> please review this patch:
+def f():
+    retrun 1
+⏎ 3 lines pasted, 44 chars — Enter to send, keep typing to add, Ctrl-C to discard:
+  │ please review this patch:
+  │ def f():
+  │     retrun 1
+… and fix the typo
+…
+```
+
+Enter sends it, typing adds to it (continuing the last line if the paste stopped
+mid-line, otherwise starting a new one), another paste is absorbed into the same
+message, and Ctrl-C throws the whole thing away.
+
+Holding it is the point. A terminal delivers a paste as one burst and `input()`
+returns at the first newline, so the harness collects the rest from the input
+buffer — and it used to send that straight to the model. Pasting fired off a
+message you had neither finished composing nor seen, since the terminal had only
+echoed the first line by the time it was gone.
+
+The clean fix would be bracketed paste, where the line editor holds the block
+itself. GNU readline 8.1+ can (`enable-bracketed-paste`), but libedit — which is
+what `readline` is on every macOS Python — cannot, and silently accepts the
+setting while ignoring it. So the confirmation lives in the harness, where it
+behaves the same on every platform.
+
+Assembly also normalizes CRLF and bare CR, and strips bracketed-paste markers if
+the terminal sends them. To type a multi-line message by hand instead, start with
+`<<<` and end with `>>>` on its own line.
 
 ## Sessions
 
@@ -535,6 +565,35 @@ emitted beats more markup parsed.
 If a reply does contain a code block of 8+ lines, the harness warns: that usually
 means the model pasted a file at you instead of calling `write_file`. The event is
 recorded in the log as `pasted_code_block` so you can grep for the habit.
+
+### Knowing it is alive
+
+Most of a turn produces no output at all, and every one of those stretches used to
+look identical to a hang. There are four, and each now keeps a status line going
+on stderr, rewritten in place:
+
+```
+⟳ step 1 · ~41200 tokens sent · 8s          prefill: the server is reading the prompt
+⟳ thinking · 21s 4300 chars so far          reasoning, with --show-thinking off
+⟳ write_file · 26s 18400 chars of arguments a tool call being assembled
+  ⎿ npm run build · 54s                     a command actually running
+```
+
+The seconds are cumulative for the request, so the number never restarts. The
+reasoning line matters most: hidden thinking streams nothing, and a long thinking
+phase on a large model is the commonest "it's stuck" moment. Tool arguments are
+the next commonest — a `write_file` of a few hundred lines arrives as tens of
+thousands of characters with nothing else on the wire.
+
+The line yields the moment real output starts, and never resumes over a
+half-written line of prose. It requires a terminal: under `--quiet`, in a pipe or
+in a cron log there is no status line, because rewriting one there would just fill
+the file with fragments.
+
+The running-command line is **not** a substitute for streaming a command's output,
+which is still not implemented — it tells you the thing is alive and for how long,
+not what it is doing. The system prompt still directs long jobs to redirect to a
+file and poll.
 
 ## System prompt
 
@@ -978,9 +1037,9 @@ examples/report/   seven-step pipeline: notes in, report out
   starts forgetting things; `--summary-model` can point at a stronger model.
 - Nothing stops the model from running a destructive command. That's the point of
   running it in a container.
-- A long-running command prints nothing until it finishes. The system prompt tells
-  the model to redirect long jobs to a file and poll, but live tool-output
-  streaming is not implemented.
+- A long-running command's **output** is not streamed: you see a status line with
+  its elapsed time, then everything at once when it exits. The system prompt tells
+  the model to redirect long jobs to a file and poll.
 - `--max-seconds` is checked between tool rounds, not inside one. A command already
   running is bounded by `--shell-timeout` instead, so the worst case is one
   command's timeout past the deadline.

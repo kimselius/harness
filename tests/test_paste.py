@@ -37,33 +37,104 @@ def test_drain() -> None:
 
 
 def test_assemble() -> None:
+    """Assembly only joins and normalises; trimming is a separate step, because
+    whether the paste ended on a newline decides where typed text goes."""
     print("assembling a paste")
     out = main.assemble_paste("one", "two\nthree\n")
-    check("joins all lines", out == "one\ntwo\nthree", repr(out))
+    check("joins all lines", out == "one\ntwo\nthree\n", repr(out))
+    check("keeps the trailing newline", out.endswith("\n"))
 
     out = main.assemble_paste("one", "two\r\nthree\r\n")
-    check("normalizes CRLF", out == "one\ntwo\nthree", repr(out))
+    check("normalizes CRLF", out == "one\ntwo\nthree\n", repr(out))
     out = main.assemble_paste("one", "two\rthree\r")
-    check("normalizes bare CR", out == "one\ntwo\nthree", repr(out))
+    check("normalizes bare CR", out == "one\ntwo\nthree\n", repr(out))
 
     bracketed = f"{main.BRACKET_START}two\nthree{main.BRACKET_END}\n"
     out = main.assemble_paste("one", bracketed)
-    check("strips bracketed paste markers", out == "one\ntwo\nthree", repr(out))
+    check("strips bracketed paste markers", out == "one\ntwo\nthree\n", repr(out))
 
-    out = main.assemble_paste("one", "two\n\n\n")
-    check("trims trailing blank lines", out == "one\ntwo", repr(out))
-    out = main.assemble_paste("a", "\nb\n")
-    check("keeps blank lines in the middle", out == "a\n\nb", repr(out))
-
-    # Paste ending mid-line: the user has not pressed Enter yet.
-    out = main.assemble_paste("one", "two\nthr", read_more=lambda: "ee")
-    check("waits for the unfinished line", out == "one\ntwo\nthree", repr(out))
-    out = main.assemble_paste("one", "two\nthr", read_more=lambda: (_ for _ in ()).throw(EOFError))
-    check("survives EOF while waiting", out == "one\ntwo\nthr", repr(out))
+    out = main.assemble_paste("one", "two\nthr")
+    check("an unfinished last line is kept as-is", out == "one\ntwo\nthr", repr(out))
+    check("and is marked by having no trailing newline", not out.endswith("\n"))
 
     code = "def f():\n    return 1\n"
     out = main.assemble_paste("# snippet", code)
-    check("indentation preserved", out == "# snippet\ndef f():\n    return 1", repr(out))
+    check("indentation preserved", out == "# snippet\ndef f():\n    return 1\n",
+          repr(out))
+
+    check("trims trailing blank lines",
+          main.trim_blank_tail("one\ntwo\n\n\n") == "one\ntwo",
+          repr(main.trim_blank_tail("one\ntwo\n\n\n")))
+    check("keeps blank lines in the middle",
+          main.trim_blank_tail("a\n\nb\n") == "a\n\nb")
+    check("leaves a clean message alone",
+          main.trim_blank_tail("a\nb") == "a\nb")
+
+
+def test_hold_paste() -> None:
+    """A paste is held for review; Enter sends it, Ctrl-C throws it away."""
+    print("holding a paste for confirmation")
+
+    def hold(text, answers, extras=None):
+        """Run hold_paste with scripted keystrokes and buffered bursts."""
+        replies = list(answers)
+        bursts = list(extras or [])
+
+        def fake_input(_prompt=""):
+            if not replies:
+                raise EOFError
+            value = replies.pop(0)
+            if isinstance(value, type) and issubclass(value, BaseException):
+                raise value
+            return value
+
+        def fake_drain(_fd, settle=0.0):
+            return bursts.pop(0) if bursts else ""
+
+        # `input` is a builtin, so there is normally no such module global. Put
+        # one in to shadow it, then remove it again — restoring it would leave a
+        # permanent shadow for every later test in this process.
+        had_input = "input" in vars(main)
+        saved_drain = main.drain_buffered
+        main.input = fake_input
+        main.drain_buffered = fake_drain
+        try:
+            with common.capture() as cap:
+                return main.hold_paste(text), cap.err
+        finally:
+            main.drain_buffered = saved_drain
+            if not had_input:
+                del main.input
+
+    out, screen = hold("one\ntwo\n", [""])
+    check("bare Enter sends it", out == "one\ntwo", repr(out))
+    check("the content is shown first", "│ one" in screen and "│ two" in screen,
+          screen)
+    check("it says Enter sends", "Enter to send" in screen, screen)
+
+    out, _ = hold("one\ntwo\n", ["and do this", ""])
+    check("typing adds a line", out == "one\ntwo\nand do this", repr(out))
+
+    # A paste that stopped mid-line is continued, not pushed onto a new line.
+    out, _ = hold("one\ntw", ["o", ""])
+    check("an unfinished line is continued", out == "one\ntwo", repr(out))
+
+    out, _ = hold("one\ntwo\n", [KeyboardInterrupt])
+    check("Ctrl-C discards the whole paste", out == "", repr(out))
+
+    out, _ = hold("one\ntwo\n", [])
+    check("EOF sends what there is", out == "one\ntwo", repr(out))
+
+    # A second burst while it is held gets appended and re-shown.
+    out, screen = hold("one\n", ["", ""], extras=["two\nthree\n", ""])
+    check("a further paste is absorbed", out == "one\ntwo\nthree", repr(out))
+    check("and re-shown", screen.count("Enter to send") == 2,
+          str(screen.count("Enter to send")))
+
+    long_text = "".join(f"line {i}\n" for i in range(40))
+    out, screen = hold(long_text, [""])
+    check("a long paste is not echoed in full", "more lines" in screen, screen[:200])
+    check("but all of it is sent", out.count("\n") == 39, str(out.count("\n")))
 
 
 def test_input_prompt_markers() -> None:
@@ -111,18 +182,26 @@ def test_input_prompt_markers() -> None:
           f"-> markers {'on' if decided else 'off'})")
 
 
+# Gap between keystroke groups, so each arrives as its own paste or line rather
+# than one burst. PASTE_SETTLE is 0.05s, so this is a wide margin; it is the
+# dominant cost of this suite, hence not wider than it needs to be.
+KEYSTROKE_GAP = 1.2
+
+
 def repl_session(base_url: str, keystrokes: list[bytes], tmp: Path) -> str:
-    # Wait between keystroke groups, so each one is a separate paste or line
-    # rather than one burst arriving together.
-    script = [(0.0 if i == 0 else 2.5, chunk) for i, chunk in enumerate(keystrokes)]
-    return ptyrun.repl(base_url, tmp, script, settle=2.5)
+    script = [
+        (0.0 if i == 0 else KEYSTROKE_GAP, chunk)
+        for i, chunk in enumerate(keystrokes)
+    ]
+    return ptyrun.repl(base_url, tmp, script, settle=KEYSTROKE_GAP)
 
 
 def test_repl_paste(tmp: Path, base_url: str) -> None:
+    """A real paste, confirmed with Enter, arrives as one message."""
     print("pasting into the real REPL")
     mock_server.set_script([("got it", [])])
     paste = b"first line\nsecond line\nthird line\n"
-    screen = repl_session(base_url, [paste, b"/exit\n"], tmp / "e2e")
+    screen = repl_session(base_url, [paste, b"\n", b"/exit\n"], tmp / "e2e")
 
     requests = [r for r in mock_server.REQUESTS if r.get("messages")]
     check("the model was called once", len(requests) == 1, str(len(requests)))
@@ -133,8 +212,29 @@ def test_repl_paste(tmp: Path, base_url: str) -> None:
     check("all three lines in it",
           users and users[0] == "first line\nsecond line\nthird line",
           repr(users[0]) if users else "")
-    check("paste was announced", "3 lines pasted" in screen, screen[-300:])
+    check("paste was announced", "3 lines pasted" in screen, screen[-400:])
+    check("the pasted lines were echoed back",
+          "│ first line" in screen and "│ third line" in screen, screen[-500:])
     check("session exited cleanly", "bye" in screen)
+
+
+def test_repl_paste_waits_for_enter(tmp: Path, base_url: str) -> None:
+    """The bug: a paste used to be sent the instant it landed.
+
+    Nothing may reach the model until Enter confirms it, however long the paste
+    sits there.
+    """
+    print("a paste is not sent on arrival")
+    mock_server.set_script([("should not happen", [])])
+    paste = b"do something dangerous\nand another line\n"
+    screen = repl_session(base_url, [paste, b"/exit\n"], tmp / "wait")
+
+    check("the model was never called",
+          not [r for r in mock_server.REQUESTS if r.get("messages")],
+          str(len(mock_server.REQUESTS)))
+    check("it was shown instead", "Enter to send" in screen, screen[-400:])
+    check("the second line is visible",
+          "│ and another line" in screen, screen[-400:])
 
 
 def test_repl_single_line_unchanged(tmp: Path, base_url: str) -> None:
@@ -192,7 +292,9 @@ def main_() -> int:
         test_drain()
         test_input_prompt_markers()
         test_assemble()
+        test_hold_paste()
         test_repl_paste(tmp, base_url)
+        test_repl_paste_waits_for_enter(tmp, base_url)
         test_repl_single_line_unchanged(tmp, base_url)
         test_repl_command_after_paste(tmp, base_url)
         test_tab_completion_in_the_repl(tmp, base_url)

@@ -181,11 +181,15 @@ class LLM:
         purpose: str = "turn",
         effort: str | None = INHERIT,
         on_reasoning: Any = None,
+        on_tool_args: Any = None,
     ) -> Reply:
         """One model call.
 
-        on_text(chunk) and on_reasoning(chunk) receive streamed deltas. Pass
-        effort=None to send no reasoning_effort for this call.
+        on_text(chunk) and on_reasoning(chunk) receive streamed deltas.
+        on_tool_args(name, chars_so_far) fires as a tool call is assembled, which
+        is otherwise an invisible wait: the arguments of a write_file can be tens
+        of thousands of characters and none of it reaches the other callbacks.
+        Pass effort=None to send no reasoning_effort for this call.
         """
         params = self._params(messages, tools, model=model, effort=effort)
         self.log.event(
@@ -198,7 +202,7 @@ class LLM:
             tool_names=[t["function"]["name"] for t in tools or []],
         )
         try:
-            reply = self._dispatch(params, on_text, on_reasoning)
+            reply = self._dispatch(params, on_text, on_reasoning, on_tool_args)
         except BadRequestError as exc:
             # Some OpenAI-compatible servers reject reasoning_effort outright.
             # Drop the fields they name and retry once, rather than failing the
@@ -207,7 +211,7 @@ class LLM:
             if retry is None:
                 self.log.event("llm_error", error=f"{type(exc).__name__}: {exc}")
                 raise
-            reply = self._dispatch(retry, on_text, on_reasoning)
+            reply = self._dispatch(retry, on_text, on_reasoning, on_tool_args)
         except Exception as exc:
             self.log.event("llm_error", error=f"{type(exc).__name__}: {exc}")
             raise
@@ -227,9 +231,11 @@ class LLM:
         )
         return reply
 
-    def _dispatch(self, params: dict, on_text: Any, on_reasoning: Any) -> Reply:
+    def _dispatch(
+        self, params: dict, on_text: Any, on_reasoning: Any, on_tool_args: Any = None
+    ) -> Reply:
         if self.cfg.stream:
-            return self._stream(params, on_text, on_reasoning)
+            return self._stream(params, on_text, on_reasoning, on_tool_args)
         return self._once(params)
 
     def _once(self, params: dict) -> Reply:
@@ -254,7 +260,10 @@ class LLM:
             reasoning=_extra(choice.message, REASONING_FIELDS),
         )
 
-    def _stream(self, params: dict, on_text: Any, on_reasoning: Any = None) -> Reply:
+    def _stream(
+        self, params: dict, on_text: Any, on_reasoning: Any = None,
+        on_tool_args: Any = None,
+    ) -> Reply:
         kwargs = dict(params, stream=True)
         if self.supports_stream_usage:
             kwargs["stream_options"] = {"include_usage": True}
@@ -307,6 +316,8 @@ class LLM:
                             slot["name"] += tc.function.name
                         if tc.function.arguments:
                             slot["arguments"] += tc.function.arguments
+                    if on_tool_args:
+                        on_tool_args(slot["name"], len(slot["arguments"]))
         except KeyboardInterrupt:
             # Keep whatever text arrived, but drop half-built tool calls: their
             # arguments are truncated JSON and must never be executed.

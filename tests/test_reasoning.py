@@ -240,6 +240,78 @@ def test_model_change_resets_calibration(tmp: Path, base_url: str) -> None:
     check("dropped parameters get another chance", agent.llm.supports_effort)
 
 
+class FakeTicker:
+    """Records what the status line was asked to display."""
+
+    def __init__(self) -> None:
+        self.shown: list[str] = []
+        self.stopped = 0
+
+    def show(self, label: str, detail: str = "") -> None:
+        self.shown.append(label + detail)
+
+    def stop(self, clear: bool = True) -> None:
+        self.stopped += 1
+
+
+def test_progress_through_silent_phases() -> None:
+    """Prefill, hidden reasoning and tool assembly all produce no output.
+
+    The status line has to survive them. It used to be stopped by the first
+    reasoning chunk and, with thinking hidden, nothing took its place — so the
+    whole reasoning phase looked like a hang.
+    """
+    print("progress through the silent phases")
+    from agent import _Printer, _Progress
+
+    # Hidden thinking: the line stays up and grows.
+    tick = FakeTicker()
+    progress = _Progress(tick, _Printer(markdown_on=False, style=False), False)
+    progress.reasoning("abcde")
+    progress.reasoning("fghij")
+    check("thinking keeps the line alive", tick.stopped == 0, str(tick.stopped))
+    check("it counts what has arrived", tick.shown[-1].endswith("10 chars so far"),
+          repr(tick.shown[-1]))
+
+    # --show-thinking prints instead, so the line gets out of the way.
+    tick = FakeTicker()
+    shown = _Progress(tick, _Printer(markdown_on=False, style=False), True)
+    with common.capture():
+        shown.reasoning("visible thought")
+    check("shown thinking stops the line", tick.stopped == 1, str(tick.stopped))
+
+    # Prose always takes the line.
+    tick = FakeTicker()
+    progress = _Progress(tick, _Printer(markdown_on=False, style=False), False)
+    with common.capture():
+        progress.text("the answer")
+    check("prose stops the line", tick.stopped == 1, str(tick.stopped))
+
+    # Tool arguments: a big one is reported, a small one is not worth drawing.
+    tick = FakeTicker()
+    progress = _Progress(tick, _Printer(markdown_on=False, style=False), False)
+    progress.tool_args("write_file", 10)
+    check("a tiny tool call is not announced", tick.shown == [], str(tick.shown))
+    progress.tool_args("write_file", 9000)
+    check("a big one is", "write_file" in tick.shown[-1] and "9000" in tick.shown[-1],
+          repr(tick.shown[-1] if tick.shown else None))
+
+    # Never resume over a half-written line of prose.
+    printer = _Printer(markdown_on=False, style=False)
+    tick = FakeTicker()
+    progress = _Progress(tick, printer, False)
+    with common.capture():
+        progress.text("no trailing newline")
+    check("printer knows it is mid-line", not printer.at_line_start)
+    progress.tool_args("write_file", 9000)
+    check("so the line is left alone", tick.shown == [], str(tick.shown))
+    with common.capture():
+        progress.text("now a complete line\n")
+    check("and resumes once the line ends", printer.at_line_start)
+    progress.tool_args("write_file", 9000)
+    check("drawing again at a boundary", len(tick.shown) == 1, str(tick.shown))
+
+
 def test_printer_streams() -> None:
     """Thinking is commentary, so it belongs on stderr with the rest of it."""
     print("printer stream split")
@@ -280,6 +352,7 @@ def main_() -> int:
         test_graceful_degradation(tmp, base_url)
         test_unrelated_400_is_not_blamed_on_parameters(tmp, base_url)
         test_model_change_resets_calibration(tmp, base_url)
+        test_progress_through_silent_phases()
         test_printer_streams()
     server.shutdown()
     return common.report()

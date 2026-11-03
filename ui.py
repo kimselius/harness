@@ -224,10 +224,19 @@ class Ticker:
     def start(self) -> None:
         if self._thread or not self._live:
             return
-        self._started = time.monotonic()
+        # Kept across a stop/start so the number on screen is the total time this
+        # request has taken, not the time since the latest phase began.
+        if not self._started:
+            self._started = time.monotonic()
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+
+    def show(self, label: str, detail: str = "") -> None:
+        """Point the ticker at a new phase, restarting it if it had stopped."""
+        self.label = label
+        self.detail = detail
+        self.start()
 
     def _run(self) -> None:
         while not self._stop.is_set():

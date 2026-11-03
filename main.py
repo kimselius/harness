@@ -149,24 +149,85 @@ def drain_buffered(fd: int, settle: float = PASTE_SETTLE) -> str:
     return steer.read_pending(fd, settle)
 
 
-def assemble_paste(first: str, rest: str, read_more=input) -> str:
-    """Join a first line with the buffered remainder of a paste."""
-    text = f"{first}\n{rest}"
+def clean_paste(text: str) -> str:
+    """Normalise a pasted burst: no bracket markers, LF line endings."""
     for marker in (BRACKET_START, BRACKET_END):
         text = text.replace(marker, "")
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def assemble_paste(first: str, rest: str) -> str:
+    """Join the line input() consumed with the rest of the burst.
+
+    Any trailing newline is kept: whether the paste ended on a line boundary
+    decides where text typed afterwards goes.
+    """
+    return clean_paste(f"{first}\n{rest}")
+
+
+def trim_blank_tail(text: str) -> str:
+    """Drop the trailing blank lines a paste almost always carries."""
     lines = text.split("\n")
-    if not text.endswith("\n"):
-        # The paste ended mid-line, so the user has not pressed Enter yet.
-        tail = lines.pop()
-        try:
-            tail += read_more()
-        except (EOFError, KeyboardInterrupt):
-            pass
-        lines.append(tail)
     while lines and not lines[-1].strip():
         lines.pop()
     return "\n".join(lines)
+
+
+# How much of a held paste to show back. The terminal has already echoed the raw
+# text as it arrived, so this is a confirmation of what was captured rather than
+# the only chance to read it — a few lines at each end is enough to recognise.
+PREVIEW_HEAD = 5
+PREVIEW_TAIL = 2
+
+
+def show_paste(text: str) -> None:
+    """Report what is held and waiting, so Enter is an informed keystroke."""
+    lines = text.split("\n")
+    ui.info(
+        f"⏎ {len(lines)} lines pasted, {len(text)} chars — "
+        "Enter to send, keep typing to add, Ctrl-C to discard:"
+    )
+    if len(lines) > PREVIEW_HEAD + PREVIEW_TAIL + 1:
+        hidden = len(lines) - PREVIEW_HEAD - PREVIEW_TAIL
+        lines = [
+            *lines[:PREVIEW_HEAD],
+            f"… {hidden} more lines …",
+            *lines[-PREVIEW_TAIL:],
+        ]
+    for line in lines:
+        ui.info(f"  │ {ui.one_line(line)}")
+
+
+def hold_paste(text: str, prompt: str = "… ") -> str:
+    """Show a pasted block and wait for Enter rather than sending it.
+
+    A terminal delivers a paste as one burst, and `input()` returns at the first
+    newline — so the remaining lines arrive unechoed and the harness used to send
+    them straight to the model. That fired off a message the user had neither
+    finished composing nor seen. Bracketed paste would let the line editor hold
+    it instead, but libedit (every macOS Python) does not implement it, so the
+    confirmation lives here, where it works the same everywhere.
+    """
+    show_paste(trim_blank_tail(text))
+    while True:
+        try:
+            typed = input(ui.input_prompt(ui.dim(prompt)))
+        except EOFError:
+            break
+        except KeyboardInterrupt:
+            ui.info("(paste discarded)")
+            return ""
+        extra = clean_paste(drain_buffered(sys.stdin.fileno()))
+        if not typed and not extra.strip():
+            break  # a bare Enter sends it
+        if typed:
+            # No separator: if the paste ended mid-line this continues that line,
+            # and if it ended on a newline this starts the next one.
+            text += typed + "\n"
+        if extra.strip():
+            text += extra
+            show_paste(trim_blank_tail(text))
+    return trim_blank_tail(text)
 
 
 def read_message(prompt: str) -> str:
@@ -177,11 +238,7 @@ def read_message(prompt: str) -> str:
     rest = drain_buffered(sys.stdin.fileno())
     if not rest.strip():
         return first
-    message = assemble_paste(first, rest)
-    count = len(message.split("\n"))
-    if count > 1:
-        ui.info(f"({count} lines pasted)")
-    return message
+    return hold_paste(assemble_paste(first, rest))
 
 
 def read_multiline() -> str:
@@ -421,7 +478,7 @@ HELP = (
     )
     + """input
   type while busy    messages are queued and picked up at the next step
-  paste              multi-line pastes are kept together as one message
+  paste              shown for review and held; Enter sends, Ctrl-C discards
   <<<                type a multi-line message, end with a line containing >>>
   Tab                complete command names and their arguments
   Ctrl-C             interrupt the running turn (kills any running command)
