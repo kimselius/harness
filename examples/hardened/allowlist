@@ -1,0 +1,4 @@
+# One POSIX extended regex per line, matched against the destination host.
+# Anchored on purpose: "ai.profitbyte.cloud" unanchored would also match
+# "ai.profitbyte.cloud.evil.example".
+^ai\.profitbyte\.cloud$

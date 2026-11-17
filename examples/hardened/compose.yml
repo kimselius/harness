@@ -1,0 +1,71 @@
+# A locked-down harness: no capabilities, read-only root, memory in RAM only,
+# and one egress allowlist it cannot route around.
+#
+#   cp ../../.env .env          # or point env_file somewhere else
+#   edit allowlist              # your model host, nothing else
+#   docker compose up --build -d proxy
+#   docker compose run --rm harness -p "do a thing"
+#
+# See README.md for what each setting buys and what it costs.
+
+services:
+  # The only way out. It sits on both networks: the harness can reach it, and it
+  # can reach the internet. Nothing else spans the two.
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy
+    networks: [locked, egress]
+    restart: unless-stopped
+    user: "65534:65534"        # nobody, so nothing has to be dropped later
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /var/run/tinyproxy:rw,size=1m,uid=65534,gid=65534
+    mem_limit: 128m
+    pids_limit: 64
+
+  harness:
+    image: harness
+    build:
+      context: ../..
+    # `locked` is an internal network: no default route, so there is no path
+    # outward except the proxy. The agent can unset these variables, but it
+    # cannot invent a route that does not exist.
+    networks: [locked]
+    environment:
+      HTTP_PROXY: http://proxy:3128
+      HTTPS_PROXY: http://proxy:3128
+      # Anything the proxy should not be asked for. Keep the harness's own
+      # endpoint out of it.
+      NO_PROXY: localhost,127.0.0.1
+      HARNESS_WORKSPACE: /work
+      HARNESS_LOG_DIR: /work/.logs
+    env_file: [.env]
+    depends_on: [proxy]
+
+    # -- the lockdown ------------------------------------------------------
+    user: "1001:1001"
+    cap_drop: [ALL]            # the harness needs none; verified
+    security_opt: [no-new-privileges:true]
+    read_only: true            # the image, including the harness's own source
+    tmpfs:
+      # Workspace in RAM: capped, and gone when the container is. Swap for a
+      # bind mount or volume when you want the output to survive.
+      - /work:rw,nosuid,size=512m,uid=1001,gid=1001
+      - /tmp:rw,noexec,nosuid,size=64m
+    mem_limit: 2g
+    cpus: 2
+    pids_limit: 256
+    ulimits:
+      # A runaway `yes > file` fills a 512m tmpfs and nothing else.
+      fsize: 268435456         # 256 MB per file
+      nofile: 1024
+    stdin_open: true
+    tty: true
+
+networks:
+  locked:
+    internal: true             # this is the line that does the work
+  egress: {}

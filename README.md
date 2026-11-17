@@ -258,6 +258,33 @@ Note that non-root already means the agent cannot `apt-get install` anything
 mid-session; `--read-only` additionally stops `pip install --user`. If you want the
 agent to be able to install things, build them into the image instead.
 
+For the full version — every capability dropped, workspace in RAM, and an egress
+allowlist the agent has no route around — see **`examples/hardened/`**. The short
+form:
+
+```sh
+docker run --rm --env-file .env \
+  --cap-drop=ALL --security-opt no-new-privileges --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --tmpfs /work:rw,nosuid,size=512m,uid=1001,gid=1001 \
+  -e HARNESS_WORKSPACE=/work -e HARNESS_LOG_DIR=/work/.logs \
+  --memory 2g --cpus 2 --pids-limit 256 --ulimit fsize=268435456 \
+  harness -p "do a thing"
+```
+
+The harness needs no Linux capabilities at all; that was verified by running a
+full task with every one removed. Do **not** add `--init`: the image already runs
+`tini` as PID 1, and Docker's init would displace it.
+
+Blocking network access is the interesting half, and it cannot be
+`--network=none` — the harness has to reach the model, and the agent shares that
+namespace. `examples/hardened/compose.yml` does it properly: the container sits
+on an `internal: true` network with no route out, and the only member that can
+also reach the outside is a proxy holding a one-host allowlist. Measured on that
+stack — the model reachable, `example.com` refused with `403 Filtered` through the
+proxy and unroutable without it, and external DNS not resolving at all, so there
+is no side-channel either.
+
 #### Just docker run
 
 No image to build. The source goes in read-only, only the workspace and logs are
@@ -489,12 +516,20 @@ credentials into the artifacts that leave it.
 
 ```sh
 chmod 600 .env                  # or use --api-key-file
-docker run --read-only --memory 2g --cpus 2 --pids-limit 512 ...   # cap the blast radius
+docker run --cap-drop=ALL --security-opt no-new-privileges --read-only \
+  --memory 2g --cpus 2 --pids-limit 256 ...        # cap the blast radius
+cd examples/hardened && docker compose up -d proxy  # and cap where it can reach
 ```
 
 Use a scoped key per container, rotate it after the container is gone, keep the
 workspace free of anything you would not paste into a chat, and read `logs/*.jsonl`
 before sharing one — redaction catches known shapes, not everything.
+
+`examples/hardened/` has the full treatment with what each flag actually buys,
+what was measured, and an explicit list of what it still does not protect
+against. The most important item on that list: **the model endpoint is an open
+channel.** An egress allowlist bounds where data can go, not whether it goes —
+anything the agent reads can leave in a prompt, by design.
 
 ## Steering while it works
 
@@ -1028,6 +1063,7 @@ util.py      truncation + path confinement + redaction
 ui.py        terminal formatting, stdout/stderr split
 
 examples/report/   seven-step pipeline: notes in, report out
+examples/hardened/ locked-down container + egress allowlist
 ```
 
 ## Known limits
