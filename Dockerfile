@@ -54,7 +54,7 @@ COPY PROMPT.md* ./
 # Only these need to be writable. The source stays owned by root, so the agent
 # cannot modify the harness that is running it, even inside the container.
 # mcp-state holds MCP logins and tokens; mount a volume over it so they survive
-# the container (see the MCP section of the README). mcp.json is not baked in:
+# the container (see docs/mcp.md). mcp.json is not baked in:
 # mount it, or point HARNESS_MCP_CONFIG at one.
 RUN mkdir -p workspace logs mcp-state && chown -R 1001:1001 workspace logs mcp-state \
     && chmod 700 mcp-state

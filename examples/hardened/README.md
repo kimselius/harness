@@ -192,7 +192,7 @@ Worth being blunt, because a list of flags invites false confidence.
   is working on. That is what sessions and the JSONL log are for.
 - **Container escape is not in scope.** This is defence in depth on top of the
   kernel's isolation, not a substitute for it. The honest posture is still the one
-  in the main README: run it on a host you are willing to lose.
+  in [the security docs](../../docs/security.md): run it on a host you are willing to lose.
 - **Resource limits bound the container, not the work.** The agent can spend the
   whole 2 GB and both CPUs for as long as the run lasts. `--max-seconds` bounds
   the run.

@@ -19,5 +19,6 @@ mcp.json
 .claude/
 .DS_Store
 README.md
+docs/
 Dockerfile
 .dockerignore
