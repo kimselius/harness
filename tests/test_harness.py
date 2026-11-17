@@ -254,10 +254,15 @@ def test_completion(tmp: Path, base_url: str) -> None:
         "subdir", "subdir/nested"])
 
     agent.log.event("user_message", content="x")  # make the session file exist
+    other = Logbook(agent.cfg.log_path.with_name("20200101-000000-abcdef.jsonl"))
+    other.event("user_message", content="earlier")
     resumable = completions("/resume ", "", agent)
     check("resume offers last", resumable[0] == "last", str(resumable[:2]))
-    check("resume offers session ids", agent.log.session_id in resumable,
+    check("resume offers other sessions", other.session_id in resumable,
           str(resumable[:3]))
+    # Resuming the session you are in is meaningless, so it is not offered.
+    check("resume does not offer the current session",
+          agent.log.session_id not in resumable, str(resumable[:3]))
 
     # Binding Tab must not raise whatever the backend is.
     check("setup_completion returns a bool",
@@ -385,6 +390,104 @@ def test_wrap_up_failure_is_survivable(tmp: Path, base_url: str) -> None:
     check("history still valid", common.pairing_ok(agent.history))
 
 
+def test_output_limit(tmp: Path, base_url: str, stream: bool) -> None:
+    print(f"reply cut off at the output token limit (stream={stream})")
+    import agent as agent_module
+
+    mode = "s" if stream else "w"
+    # A tool call whose reply hit the limit: its arguments are whatever was
+    # generated before the cut, so it must not run.
+    mock_server.reset()
+    mock_server.set_script([
+        ("", [("write_file", {"path": "big.txt", "content": "x"})]),
+        ("done", []),
+    ])
+    mock_server.FINISH_REASON.extend(["length", "stop"])
+    agent = common.make_agent(tmp / f"cut-{mode}", base_url, stream=stream)
+    with common.capture() as cap:
+        final = agent.run("write a big file")
+    check("turn carried on to an answer", final == "done", final)
+    check("cut-off call was not run",
+          not (agent.cfg.workspace / "big.txt").exists())
+    results = [m for m in agent.history if m["role"] == "tool"]
+    check("model told why",
+          len(results) == 1 and "cut off at the output token limit"
+          in results[0]["content"], str(results)[:200])
+    check("pairing intact", common.pairing_ok(agent.history))
+    check("user warned", "cut off" in cap.err, cap.err[-200:])
+    logged = [r for r in common.records(agent) if r["type"] == "tool_result"]
+    check("answer logged, marked not executed",
+          len(logged) == 1 and logged[0].get("executed") is False, str(logged)[:200])
+
+    # A text reply that hit the limit is not a finished answer.
+    mock_server.reset()
+    mock_server.set_script([("half an ans", [])])
+    mock_server.FINISH_REASON.append("length")
+    agent = common.make_agent(tmp / f"cuttext-{mode}", base_url, stream=stream)
+    with common.capture():
+        agent.run("explain")
+    check("status is truncated",
+          agent.outcome.status == agent_module.TRUNCATED, agent.outcome.status)
+    check("partial text still returned", agent.outcome.text == "half an ans",
+          agent.outcome.text)
+    check("logged", any(r["type"] == "reply_truncated"
+                        for r in common.records(agent)))
+    mock_server.reset()
+
+
+def test_file_writes(tmp: Path) -> None:
+    print("write_file / edit_file are atomic and encoding safe")
+    import os
+    import stat
+
+    import tools as toolkit
+    from session import Session
+
+    cfg = common.make_config(tmp / "writes")
+    session = Session(cfg.workspace)
+    ws = cfg.workspace
+
+    # Not UTF-8: a decode-with-replacement edit would rewrite every é as U+FFFD.
+    latin = ws / "latin.txt"
+    original = "caf\u00e9 one\nline two\n".encode("latin-1")
+    latin.write_bytes(original)
+    try:
+        toolkit.tool_edit_file(
+            {"path": "latin.txt", "old_string": "two", "new_string": "2"},
+            cfg, session,
+        )
+        check("non-UTF-8 edit refused", False, "no error")
+    except ToolError as exc:
+        check("non-UTF-8 edit refused", "not valid UTF-8" in str(exc), str(exc))
+    check("file untouched", latin.read_bytes() == original)
+    check("reading it still works",
+          "line two" in toolkit.tool_read_file({"path": "latin.txt"}, cfg, session))
+
+    script = ws / "run.sh"
+    script.write_text("#!/bin/sh\necho old\n")
+    script.chmod(0o755)
+    toolkit.tool_edit_file(
+        {"path": "run.sh", "old_string": "old", "new_string": "new"}, cfg, session
+    )
+    check("edit applied", script.read_text() == "#!/bin/sh\necho new\n")
+    check("edit keeps the mode", stat.S_IMODE(script.stat().st_mode) == 0o755,
+          oct(script.stat().st_mode))
+    toolkit.tool_write_file({"path": "run.sh", "content": "echo replaced\n"},
+                            cfg, session)
+    check("overwrite keeps the mode", stat.S_IMODE(script.stat().st_mode) == 0o755)
+
+    toolkit.tool_write_file({"path": "new/file.txt", "content": "a\r\nb"},
+                            cfg, session)
+    check("content written exactly",
+          (ws / "new" / "file.txt").read_bytes() == b"a\r\nb")
+    umask = os.umask(0)
+    os.umask(umask)
+    check("new file gets the umask mode",
+          stat.S_IMODE((ws / "new" / "file.txt").stat().st_mode) == 0o666 & ~umask)
+    leftovers = [p.name for p in ws.rglob("*.tmp")]
+    check("no temp files left behind", not leftovers, str(leftovers))
+
+
 def main() -> int:
     server, base_url = mock_server.start()
     with tempfile.TemporaryDirectory() as raw:
@@ -403,6 +506,9 @@ def main() -> int:
         test_step_limit_wraps_up(tmp, base_url)
         test_wrap_up_discards_tool_calls(tmp, base_url)
         test_wrap_up_failure_is_survivable(tmp, base_url)
+        test_output_limit(tmp, base_url, stream=False)
+        test_output_limit(tmp, base_url, stream=True)
+        test_file_writes(tmp)
     server.shutdown()
     return common.report()
 

@@ -9,13 +9,13 @@ from typing import Any
 
 import context
 import markdown
-import tools as toolkit
 import ui
 from config import Config
 from context import INTERRUPT_NOTE, SUMMARY_FALLBACK, deadline_note, step_limit_note
 from llm import LLM
 from logbook import Logbook
 from session import Session
+from toolset import ToolSet
 from util import ToolError, ToolInterrupted, truncate
 
 # How a turn ended. `ok` is the only status that means the model decided it was
@@ -26,6 +26,15 @@ ERROR = "error"
 MAX_STEPS = "max_steps"
 INTERRUPTED = "interrupted"
 TIMEOUT = "timeout"
+TRUNCATED = "truncated"
+
+# Tool result for a call whose reply hit the output token limit.
+CUT_OFF_NOTE = (
+    "ERROR: your reply was cut off at the output token limit before this call "
+    "was complete, so it was not run. Split the work into smaller calls (for "
+    "example, write a large file in parts: write_file for the first part, then "
+    "edit_file or shell `cat >>` for the rest)."
+)
 
 
 @dataclass
@@ -177,7 +186,10 @@ class Agent:
         self.session = Session(cfg.workspace)
         # The harness's own credentials are of no use to the model.
         self.redactor = cfg.redactor()
-        self.meter = context.TokenMeter(toolkit.TOOL_SCHEMAS)
+        # Built-ins now; MCP servers add theirs once they connect.
+        self.tools = ToolSet.builtin()
+        self.meter = context.TokenMeter(self.tools.schemas)
+        self._metered_tools = self.tools.version
         self.compactions = 0
         self.interrupted = False
         self.last_reasoning_tokens: int | None = None
@@ -185,10 +197,17 @@ class Agent:
         self.outcome = Outcome()
         # Optional InputQueue: messages typed while the turn is running.
         self.inbox: Any = None
+        # Optional McpRuntime. Synced before every request, which is how a
+        # server's changed tool list reaches the model mid-session.
+        self.mcp: Any = None
+        # The status line of the tool running right now, so something that has
+        # to talk to the user mid-call (an MCP elicitation) can pause it.
+        self.active_ticker: Any = None
 
     def model_changed(self) -> None:
         """Forget tokenizer calibration and let dropped parameters be retried."""
-        self.meter = context.TokenMeter(toolkit.TOOL_SCHEMAS)
+        self.meter = context.TokenMeter(self.tools.schemas)
+        self._metered_tools = self.tools.version
         self.llm.supports_effort = True
         self.llm.supports_extra_body = True
 
@@ -227,14 +246,23 @@ class Agent:
                 }
             )
         if missing:
-            self.log.event("history_repaired", count=len(missing), reason=reason)
+            self.log.event(
+                "history_repaired",
+                count=len(missing),
+                reason=reason,
+                # Replay re-creates exactly these answers.
+                ids=[call["id"] for call in missing],
+            )
 
     def _messages(self) -> list[dict[str, Any]]:
         # System prompt is rebuilt per request, so PROMPT.md edits apply live.
         # The state block is appended, never stored: the model always sees current
         # values, history keeps no stale copies, and the prompt prefix stays cached.
         return [
-            {"role": "system", "content": self.cfg.system_prompt()},
+            {
+                "role": "system",
+                "content": self.cfg.system_prompt(self.tools.names(), self.tools.notes),
+            },
             *self.history,
             # Role "user", not "system": Gemma-style templates have no system role,
             # so a trailing system message can be dropped by the server's template.
@@ -246,8 +274,15 @@ class Agent:
         return _Printer(self.cfg.markdown and style, style, self.cfg.show_thinking)
 
     # -- context accounting ------------------------------------------------
+    def sync_tools(self) -> None:
+        """Re-meter the tool schemas if the tool list changed since last time."""
+        if self.tools.version != self._metered_tools:
+            self.meter.set_tools(self.tools.schemas)
+            self._metered_tools = self.tools.version
+
     def used_tokens(self) -> int:
         """Estimated tokens the next request would send (system + history + tools)."""
+        self.sync_tools()
         return self.meter.tokens(self._messages())
 
     def maybe_compact(self) -> bool:
@@ -399,15 +434,30 @@ class Agent:
             guard += 1
             if self._shrink_largest_message():
                 continue
-            if len(self.history) <= 2:
+            # Everything up to and including the summary stays: the pinned
+            # request (when there is one) sits in front of it.
+            start = self._tail_start()
+            if len(self.history) <= start + 1:
                 return  # nothing safe left to remove
-            dropped = self.history.pop(1)  # keep [0], the summary
+            dropped = self.history.pop(start)
             # Never leave an orphaned tool result at the front of the tail.
-            while len(self.history) > 1 and self.history[1].get("role") == "tool":
-                self.history.pop(1)
+            while (
+                len(self.history) > start + 1
+                and self.history[start].get("role") == "tool"
+            ):
+                self.history.pop(start)
             self.log.event(
                 "history_trimmed", role=dropped.get("role"), tokens=self.used_tokens()
             )
+
+    def _tail_start(self) -> int:
+        """Index of the first message after the compaction summary (1 if none)."""
+        for i, message in enumerate(self.history):
+            if message.get("role") == "user" and (
+                message.get("content") or ""
+            ).startswith(context.SUMMARY_HEADER):
+                return i + 1
+        return 1
 
     def _shrink_largest_message(self, floor: int = 600) -> bool:
         """Halve the biggest oversized message. False when there is nothing left.
@@ -522,6 +572,8 @@ class Agent:
             # the next request goes out. History is well formed at this point:
             # every tool call of the last round already has its result.
             self.take_queued_input()
+            if self.mcp is not None:
+                self.mcp.sync(self.tools)
             self.maybe_compact()
             printer = self._printer()
 
@@ -538,7 +590,7 @@ class Agent:
             try:
                 reply = self.llm.complete(
                     messages,
-                    toolkit.TOOL_SCHEMAS,
+                    self.tools.schemas,
                     on_text=progress.text,
                     on_reasoning=progress.reasoning,
                     on_tool_args=progress.tool_args,
@@ -571,19 +623,33 @@ class Agent:
             if reply.content.strip():
                 final_text = reply.content
 
+            cut_off = reply.finish_reason == "length"
             if not reply.tool_calls:
+                if cut_off:
+                    # A reply that hit the output limit is not an answer the model
+                    # chose to give, so it must not exit 0.
+                    ui.warn("! reply cut off at the output token limit (--max-tokens)")
+                    self.log.event("reply_truncated", step=step)
+                    return self._finish(TRUNCATED, final_text, step, calls)
                 return self._finish(OK, final_text, step, calls)
+
+            if cut_off:
+                # The arguments are whatever was generated before the limit: never
+                # run them. Say why, so the next attempt is smaller rather than
+                # an identical call cut off at the same place.
+                ui.warn("! tool call cut off at the output token limit; not run")
+                for call in reply.tool_calls:
+                    self.history.append(self._unrun(call, step, CUT_OFF_NOTE))
+                continue
 
             for call in reply.tool_calls:
                 if self.interrupted:
                     # Don't start the remaining calls of an interrupted round, but
                     # still answer them so the history stays well formed.
                     self.history.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call["id"],
-                            "content": "ERROR: not run, the user interrupted the turn",
-                        }
+                        self._unrun(
+                            call, step, "ERROR: not run, the user interrupted the turn"
+                        )
                     )
                     continue
                 calls += 1
@@ -648,7 +714,9 @@ class Agent:
             # an unanswered tool_calls message is an invalid history.
             self.log.event("wrapup_tool_calls_ignored",
                            names=[c["name"] for c in reply.tool_calls])
-        self.history.append({"role": "assistant", "content": reply.content})
+        # An empty reply adds nothing, and replay skips empty replies too.
+        if reply.content.strip():
+            self.history.append({"role": "assistant", "content": reply.content})
         return reply.content.strip() or fallback
 
     def _past_deadline(self, started: float) -> bool:
@@ -669,6 +737,26 @@ class Agent:
         return True
 
     # -- tool dispatch -----------------------------------------------------
+    def _unrun(self, call: dict[str, Any], step: int, content: str) -> dict[str, Any]:
+        """Answer a tool call that was deliberately not executed.
+
+        Logged as a tool_result like any other, so a resumed session replays
+        the same answer instead of leaving the call for repair to guess at.
+        """
+        self.log.event(
+            "tool_result",
+            step=step,
+            id=call["id"],
+            name=call["name"],
+            is_error=True,
+            executed=False,
+            duration_s=0.0,
+            truncated=False,
+            output_chars=len(content),
+            output=content,
+        )
+        return {"role": "tool", "tool_call_id": call["id"], "content": content}
+
     def _run_tool(self, call: dict[str, Any], step: int) -> dict[str, Any]:
         name = call["name"]
         raw_args = call["arguments"]
@@ -683,8 +771,10 @@ class Agent:
             )
         if args is not None:
             ui.tool_call(name, args)
+            source = self.tools.source(name)
             self.log.event(
-                "tool_call", step=step, id=call["id"], name=name, arguments=args
+                "tool_call", step=step, id=call["id"], name=name, arguments=args,
+                **({"server": source} if source and source != "built-in" else {}),
             )
             started = time.monotonic()
             # A command produces nothing until it exits, so without this a long
@@ -692,8 +782,13 @@ class Agent:
             # streaming the output, but it does show the thing is alive.
             running = ui.Ticker(f"  ⎿ {ui.one_line(_tool_label(name, args), 60)} ·")
             running.start()
+            self.active_ticker = running
             try:
-                result, is_error = toolkit.execute(name, args, self.cfg, self.session), False
+                result = self.tools.execute(
+                    name, args, self.cfg, self.session,
+                    progress=lambda detail, tick=running: tick.set(f" {detail}"),
+                )
+                is_error = False
             except ToolError as exc:
                 result, is_error = f"ERROR: {exc}", True
             except ToolInterrupted as exc:
@@ -707,6 +802,7 @@ class Agent:
                 result, is_error = f"ERROR: {type(exc).__name__}: {exc}", True
             finally:
                 running.stop()
+                self.active_ticker = None
             elapsed = time.monotonic() - started
         else:
             ui.tool_call(name, {"raw_arguments": raw_args})
@@ -715,7 +811,8 @@ class Agent:
             )
             elapsed = 0.0
 
-        result = self.redactor.scrub_output(result)
+        # Fresh each time: MCP credentials can be learned mid-session.
+        result = self.cfg.redactor().scrub_output(result)
         clamped, note = truncate(
             result, self.cfg.max_output_chars, self.cfg.max_output_lines
         )

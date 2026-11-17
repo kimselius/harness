@@ -16,9 +16,17 @@ import context
 import markdown
 import sessions
 import steer
-import tools as toolkit
 import ui
-from agent import ERROR, INTERRUPTED, MAX_STEPS, OK, TIMEOUT, Agent, Outcome
+from agent import (
+    ERROR,
+    INTERRUPTED,
+    MAX_STEPS,
+    OK,
+    TIMEOUT,
+    TRUNCATED,
+    Agent,
+    Outcome,
+)
 from config import (
     Config,
     anchor,
@@ -28,12 +36,13 @@ from config import (
     normalize_effort,
 )
 from logbook import Logbook
+from toolset import ToolSet
 
 # Which signal ended the run, if any, so the exit code can say which.
 _SIGNAL: int | None = None
 
 # Exit codes a calling script can branch on. 2 belongs to argparse.
-EXIT_CODES = {OK: 0, ERROR: 1, MAX_STEPS: 3, TIMEOUT: 4}
+EXIT_CODES = {OK: 0, ERROR: 1, MAX_STEPS: 3, TIMEOUT: 4, TRUNCATED: 5}
 EXIT_SIGINT = 130
 EXIT_SIGTERM = 143
 
@@ -279,9 +288,14 @@ def cmd_help(agent: Agent, rest: str) -> None:
 
 
 def cmd_tools(agent: Agent, rest: str) -> None:
-    for tool in toolkit.TOOLS:
-        params = ", ".join(tool.schema["function"]["parameters"]["properties"])
-        print(f"  {ui.bold(tool.name):<24} {ui.dim(params)}")
+    groups = agent.tools.groups()
+    for source, entries in groups.items():
+        if len(groups) > 1:
+            cost = ToolSet.schema_chars(entries)
+            ui.info(f"{source} · {len(entries)} tools · {cost} chars per request")
+        for entry in entries:
+            props = entry.schema["function"].get("parameters", {}).get("properties", {})
+            print(f"  {ui.bold(entry.name):<24} {ui.dim(', '.join(props))}")
 
 
 def cmd_model(agent: Agent, rest: str) -> None:
@@ -295,7 +309,7 @@ def cmd_model(agent: Agent, rest: str) -> None:
 
 def cmd_prompt(agent: Agent, rest: str) -> None:
     ui.info(f"source: {agent.cfg.prompt_source}")
-    print(agent.cfg.system_prompt())
+    print(agent.cfg.system_prompt(agent.tools.names(), agent.tools.notes))
 
 
 def cmd_history(agent: Agent, rest: str) -> None:
@@ -414,14 +428,16 @@ def cmd_resume(agent: Agent, rest: str) -> None:
         ui.warn("usage: /resume <session-id|last>")
         return
     try:
-        path = sessions.resolve(cfg.log_path.parent, rest.strip())
+        path = sessions.resolve(
+            cfg.log_path.parent, rest.strip(), exclude=cfg.log_path
+        )
     except sessions.SessionError as exc:
         ui.warn(str(exc))
         return
     if path == cfg.log_path:
         ui.info("already in that session")
         return
-    agent.attach_log(Logbook(path, scrub=cfg.redactor().scrub_log))
+    agent.attach_log(Logbook(path, scrub=cfg.scrub_log))
     cfg.log_path = path
     agent.log.session_start(cfg, resumed=True)
     report_resume(agent, restore(agent))
@@ -429,12 +445,27 @@ def cmd_resume(agent: Agent, rest: str) -> None:
 
 def complete_resume(agent: Agent) -> list[str]:
     return ["last"] + [
-        path.stem for path in sessions.session_files(agent.cfg.log_path.parent)
+        path.stem
+        for path in sessions.session_files(
+            agent.cfg.log_path.parent, exclude=agent.cfg.log_path
+        )
     ]
 
 
 def cmd_exit(agent: Agent, rest: str) -> bool:
     return False
+
+
+def cmd_mcp(agent: Agent, rest: str) -> None:
+    import mcp_cli  # only when used: the MCP SDK is slow to import
+
+    mcp_cli.command(agent, rest)
+
+
+def complete_mcp(agent: Agent) -> list[str]:
+    import mcp_cli
+
+    return mcp_cli.complete_command(agent)
 
 
 COMMANDS: list[Command] = [
@@ -459,6 +490,8 @@ COMMANDS: list[Command] = [
     Command("sessions", "", "list recorded sessions", cmd_sessions),
     Command("resume", "<id>", 'load an earlier session (id, prefix, or "last")',
             cmd_resume, complete_resume),
+    Command("mcp", "[help|…]", "MCP servers: status, tools, login (/mcp help)",
+            cmd_mcp, complete_mcp),
     Command("exit", "", "leave (also /quit, /q, or Ctrl-D)", cmd_exit,
             aliases=("quit", "q")),
 ]
@@ -492,6 +525,10 @@ def completions(buffer: str, text: str, agent: Agent) -> list[str]:
     if not line.startswith("/"):
         return []
     head, space, _ = line.partition(" ")
+    if head.startswith("/mcp__") and agent.mcp is not None:
+        import mcp_cli
+
+        return mcp_cli.complete(agent.mcp, buffer, text)
     if not space:  # still typing the command itself
         prefix = head[1:].lower()
         return [f"/{command.name}" for command in COMMANDS
@@ -674,12 +711,35 @@ def main() -> int:
     if args.sessions:
         list_sessions(anchor(args.log_dir))
         return 0
+    if args.mcp_login or args.mcp_logout or args.mcp_list:
+        import mcp_cli
+
+        install_signal_handlers()
+        return mcp_cli.manage(args) or 0
     cfg = config_from_args(args)
     ui.set_quiet(cfg.quiet)
     install_signal_handlers()
-    log = Logbook(cfg.log_path, scrub=cfg.redactor().scrub_log)
+    log = Logbook(cfg.log_path, scrub=cfg.scrub_log)
     log.session_start(cfg, resumed=cfg.resumed)
     agent = Agent(cfg, log)
+    try:
+        return session(cfg, args, log, agent)
+    finally:
+        if agent.mcp is not None:
+            agent.mcp.shutdown()
+
+
+def fail_oneshot(cfg: Config, agent: Agent, log: Logbook, message: str) -> int:
+    """End an unattended run before it started, the way every failure ends."""
+    ui.error(f"! {message}")
+    agent.outcome = Outcome(status=ERROR, error=message)
+    log.event("session_end", mode="oneshot", status=ERROR, exit_code=1,
+              error=message, **agent.session.totals())
+    write_result(cfg, agent, 1)
+    return 1
+
+
+def session(cfg: Config, args, log: Logbook, agent: Agent) -> int:
     resume_stats = restore(agent) if cfg.resumed else None
 
     # One-shot: -p flag, or a message piped on stdin.
@@ -688,9 +748,33 @@ def main() -> int:
     if oneshot is None and not interactive:
         piped = sys.stdin.read().strip()
         oneshot = piped or None
+
+    if cfg.mcp_enabled:
+        import mcp_cli
+
+        try:
+            mcp_cli.start(cfg, agent, log, interactive=not oneshot and interactive)
+        except SystemExit as exc:  # a broken mcp.json
+            if oneshot:
+                return fail_oneshot(cfg, agent, log, str(exc))
+            ui.error(f"! {exc}")
+        if oneshot and agent.mcp is not None:
+            # A step written to use a server must not run without it and
+            # quietly do something else.
+            reason = mcp_cli.unavailable(agent.mcp)
+            if reason:
+                return fail_oneshot(cfg, agent, log, f"MCP unavailable: {reason}")
+
     if oneshot:
         if resume_stats is not None:
             report_resume(agent, resume_stats, transcript=False)
+        if oneshot.startswith("/mcp__"):
+            import mcp_cli
+
+            try:
+                oneshot = mcp_cli.expand_prompt(agent.mcp, oneshot) or oneshot
+            except Exception as exc:
+                return fail_oneshot(cfg, agent, log, f"MCP prompt: {exc}")
         outcome = run_turn(agent, oneshot)
         code = exit_code(outcome)
         log.event("session_end", mode="oneshot", status=outcome.status,
@@ -754,7 +838,15 @@ def main() -> int:
         if not line:
             continue
         # A multi-line paste is a message, never a command, even if it opens with /.
-        if line.startswith("/") and "\n" not in line:
+        if line.startswith("/mcp__") and "\n" not in line and agent.mcp is not None:
+            import mcp_cli
+
+            try:
+                line = mcp_cli.expand_prompt(agent.mcp, line) or line
+            except Exception as exc:
+                ui.warn(f"! {exc}")
+                continue
+        elif line.startswith("/") and "\n" not in line:
             if not handle_command(line, agent):
                 break
             continue

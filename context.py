@@ -98,9 +98,14 @@ class TokenMeter:
 
     def __init__(self, tools: list[dict] | None = None) -> None:
         self.chars_per_token = DEFAULT_CHARS_PER_TOKEN
-        self.tools_chars = len(json.dumps(tools or [], default=str))
+        self.tools_chars = 0
+        self.set_tools(tools)
         self.samples = 0
         self.last_prompt_tokens: int | None = None
+
+    def set_tools(self, tools: list[dict] | None) -> None:
+        """The tool schemas sent with every request. Calibration is kept."""
+        self.tools_chars = len(json.dumps(tools or [], default=str))
 
     @staticmethod
     def chars(messages: list[dict[str, Any]]) -> int:

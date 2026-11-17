@@ -38,6 +38,10 @@ REJECT: set[str] = set()
 # the SDK, so one entry is enough to surface the error to the caller).
 FAIL_NEXT: list[bool] = []
 
+# finish_reason overrides, one per request, taken from the front. Lets a test
+# simulate a reply cut off at the output token limit ("length").
+FINISH_REASON: list[str] = []
+
 
 def set_script(script: list[tuple[str, list[tuple[str, dict]]]]) -> None:
     """Replace the canned turns and reset the request counter."""
@@ -50,6 +54,7 @@ def reset() -> None:
     REASONING.clear()
     REJECT.clear()
     FAIL_NEXT.clear()
+    FINISH_REASON.clear()
     REQUESTS.clear()
 
 
@@ -86,10 +91,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         index = min(len(REQUESTS) - 1, len(ACTIVE) - 1)
         text, calls = ACTIVE[index]
+        finish = FINISH_REASON.pop(0) if FINISH_REASON else None
         if body.get("stream"):
-            self._stream(text, calls)
+            self._stream(text, calls, finish)
         else:
-            self._whole(text, calls)
+            self._whole(text, calls, finish)
 
     def _usage(self) -> dict:
         usage = {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
@@ -119,7 +125,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def _whole(self, text: str, calls: list[tuple[str, dict]]) -> None:
+    def _whole(
+        self, text: str, calls: list[tuple[str, dict]], finish: str | None = None
+    ) -> None:
         payload = {
             "id": "chatcmpl-mock",
             "object": "chat.completion",
@@ -129,14 +137,16 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "index": 0,
                     "message": self._message(text, calls),
-                    "finish_reason": "tool_calls" if calls else "stop",
+                    "finish_reason": finish or ("tool_calls" if calls else "stop"),
                 }
             ],
             "usage": self._usage(),
         }
         self._send(json.dumps(payload).encode(), "application/json")
 
-    def _stream(self, text: str, calls: list[tuple[str, dict]]) -> None:
+    def _stream(
+        self, text: str, calls: list[tuple[str, dict]], finish: str | None = None
+    ) -> None:
         chunks: list[dict] = []
 
         def frame(delta: dict, finish=None) -> dict:
@@ -185,7 +195,7 @@ class Handler(BaseHTTPRequestHandler):
                         }
                     )
                 )
-        chunks.append(frame({}, "tool_calls" if calls else "stop"))
+        chunks.append(frame({}, finish or ("tool_calls" if calls else "stop")))
         usage_frame = {
             "id": "chatcmpl-mock",
             "object": "chat.completion.chunk",

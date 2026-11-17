@@ -1,0 +1,29 @@
+{
+  "mcpServers": {
+    "linear": {
+      "type": "http",
+      "url": "https://mcp.linear.app/mcp"
+    },
+    "internal": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": {"Authorization": "Bearer ${INTERNAL_MCP_TOKEN}"},
+      "tools": ["search", "get_document"]
+    },
+    "machine": {
+      "type": "http",
+      "url": "https://api.example.com/mcp",
+      "oauth": {
+        "grant": "client_credentials",
+        "clientId": "${MACHINE_CLIENT_ID}",
+        "clientSecret": "${MACHINE_CLIENT_SECRET}",
+        "issuer": "https://auth.example.com"
+      }
+    },
+    "files": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/srv/data"],
+      "enabled": false
+    }
+  }
+}

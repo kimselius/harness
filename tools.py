@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import os
 import signal
+import stat
 import subprocess
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,7 +66,13 @@ def _require_str(args: dict, key: str) -> str:
     return value
 
 
-def _read_text(path: Path, cfg: Config | None = None) -> str:
+def _read_text(path: Path, cfg: Config | None = None, strict: bool = False) -> str:
+    """Read a text file for a tool.
+
+    `strict` is for callers that write the text back. Replacing undecodable
+    bytes is harmless when the text is only shown, but an edit would save the
+    replacement characters over every one of them, far from the edited spot.
+    """
     if not path.exists():
         # State the resolved path. The rule that produced it is in the per-request
         # state block, so the model never has to infer it from an error message.
@@ -82,7 +90,48 @@ def _read_text(path: Path, cfg: Config | None = None) -> str:
     data = path.read_bytes()
     if b"\x00" in data[:8192]:
         raise ToolError(f"{path} looks like a binary file; use shell tools instead")
-    return data.decode("utf-8", errors="replace")
+    if not strict:
+        return data.decode("utf-8", errors="replace")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        where = display_path(cfg.workspace, path) if cfg else path
+        raise ToolError(
+            f"{where} is not valid UTF-8 (byte {exc.start}); edit_file would "
+            "corrupt it. Edit it with shell tools (sed, python) instead."
+        ) from None
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    """Replace a file's contents so it is never seen half written.
+
+    A kill partway through (timeout, Ctrl-C, docker stop) leaves the old file
+    intact instead of a truncated one. The existing mode is kept, so an edited
+    script stays executable.
+    """
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        mode = None
+    fd, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        # newline="" writes the text exactly as given, the same as write_text
+        # on POSIX; no platform newline translation.
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        if mode is None:
+            # mkstemp creates 0600; a new file gets the usual umask-based mode.
+            umask = os.umask(0)
+            os.umask(umask)
+            mode = 0o666 & ~umask
+        os.chmod(temp, mode)
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
@@ -119,7 +168,10 @@ SHELL_SCHEMA: dict[str, Any] = {
             "call applies to every later call. It starts at the workspace root "
             "and cannot leave it. Note that read_file, write_file and edit_file "
             "ignore it: their paths are always relative to the workspace root, "
-            "the same way every tool result prints them."
+            "the same way every tool result prints them. Commands get no stdin, "
+            "so anything interactive fails at once: pass -y / --yes style flags. "
+            "A background job (`cmd &`) must redirect its output to a file, or "
+            "this call waits for it until the timeout."
         ),
         "parameters": {
             "type": "object",
@@ -155,6 +207,10 @@ def tool_shell(args: dict, cfg: Config, session: Session) -> str:
         shell=True,
         cwd=str(session.cwd),
         env=cfg.child_env(),
+        # Never the terminal. A command that reads input (a confirmation prompt,
+        # `read`, an editor) would otherwise compete with the REPL for keystrokes
+        # or hang until the timeout; with no input it fails at once instead.
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -295,7 +351,7 @@ def tool_write_file(args: dict, cfg: Config, session: Session) -> str:
     existed = path.exists()
     made = [p for p in path.parents if not p.exists() and cfg.workspace in p.parents]
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    _write_atomic(path, content)
     verb = "Overwrote" if existed else "Created"
     note = ""
     if made:
@@ -351,7 +407,7 @@ def tool_edit_file(args: dict, cfg: Config, session: Session) -> str:
     if old == new:
         raise ToolError("old_string and new_string are identical; nothing to do")
 
-    text = _read_text(path, cfg)
+    text = _read_text(path, cfg, strict=True)
     count = text.count(old)
     if count == 0:
         raise ToolError(
@@ -364,7 +420,7 @@ def tool_edit_file(args: dict, cfg: Config, session: Session) -> str:
             "unique, or pass replace_all=true."
         )
 
-    path.write_text(text.replace(old, new), encoding="utf-8")
+    _write_atomic(path, text.replace(old, new))
     where = f"{count} occurrences" if count > 1 else "1 occurrence"
     return f"Edited {display_path(cfg.workspace, path)} ({where} replaced)"
 

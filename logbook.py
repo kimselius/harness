@@ -52,14 +52,11 @@ class Logbook:
             **_clip(fields),
         }
         line = json.dumps(self.scrub(record), ensure_ascii=False, default=str)
-        existed = self.path.exists()
-        with self.path.open("a", encoding="utf-8") as fh:
+        # Created 0600 in the same call that opens it, so there is no moment
+        # where a fresh transcript is readable by other accounts.
+        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
-        if not existed:
-            try:
-                os.chmod(self.path, 0o600)
-            except OSError:
-                pass
 
     def session_start(self, cfg: Any, resumed: bool = False) -> None:
         self.event(

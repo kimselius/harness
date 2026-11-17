@@ -32,6 +32,8 @@ SUITES = [
     "interrupt",
     "steer",
     "paste",
+    "mcp",
+    "mcp_auth",
 ]
 
 

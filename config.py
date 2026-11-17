@@ -46,7 +46,7 @@ Operating rules:
 # Always appended, so the model knows the real limits even with a custom PROMPT.md.
 RUNTIME_FACTS = """\
 <environment>
-Tools: shell, read_file, write_file, edit_file.
+Tools: {tools}.
 Workspace root: {workspace}
 Nothing outside that root is reachable, and every path a tool prints is relative to
 it.
@@ -83,8 +83,10 @@ Shell commands are killed after {timeout:.0f}s by default ({max_timeout:.0f}s ma
 Your replies are printed in a terminal about {columns} columns wide. Write plain
 prose in short paragraphs. Inline code, paths and fenced code blocks are fine;
 headings, tables and nested bullet lists are not worth the space.
-</environment>
+{external}</environment>
 """
+
+BUILTIN_TOOL_NAMES = ["shell", "read_file", "write_file", "edit_file"]
 
 
 @dataclass
@@ -119,6 +121,16 @@ class Config:
     label: str | None  # free-text tag for finding a run in a pipeline
     result_file: Path | None
     quiet: bool
+    # MCP. Off unless MCP_ENABLED is set; see mcp_client.py.
+    mcp_enabled: bool = False
+    mcp_config: Path = field(default_factory=lambda: BASE_DIR / "mcp.json")
+    mcp_state_dir: Path = field(default_factory=lambda: BASE_DIR / "mcp-state")
+    mcp_timeout: float = 120.0
+    mcp_connect_timeout: float = 30.0
+    # Credentials learned at runtime (MCP headers, tokens). They join the API key
+    # in every redactor built from now on, including ones already handed out
+    # through scrub_log.
+    extra_secrets: set[str] = field(default_factory=set, repr=False)
 
     @property
     def compact_threshold(self) -> int:
@@ -138,15 +150,37 @@ class Config:
             match = re.search(r"://[^/\s:@]+:([^/\s@]+)@", self.base_url)
             if match:
                 literals.append(match.group(1))
+        literals.extend(self.extra_secrets)
         return Redactor(literals, patterns=self.redact)
 
-    def system_prompt(self) -> str:
-        """PROMPT.md if present, else the built-in prompt; runtime facts appended."""
+    def add_secrets(self, values: list[str] | set[str]) -> None:
+        self.extra_secrets.update(v for v in values if v)
+
+    def scrub_log(self, value: object) -> object:
+        """Log scrubber that always uses the current set of secrets.
+
+        Hand this to a Logbook rather than `redactor().scrub_log`, which freezes
+        the secrets known at the time — a token refreshed mid-session would then
+        go into the log in clear.
+        """
+        return self.redactor().scrub_log(value)
+
+    def system_prompt(
+        self, tool_names: list[str] | None = None, external: str = ""
+    ) -> str:
+        """PROMPT.md if present, else the built-in prompt; runtime facts appended.
+
+        `tool_names` defaults to the built-ins. `external` is a paragraph about
+        tools that reach outside the workspace (MCP), placed inside the
+        environment block; empty means the block is exactly what it always was.
+        """
         if self.prompt_file.is_file():
             body = self.prompt_file.read_text(encoding="utf-8").strip()
         else:
             body = DEFAULT_PROMPT.strip()
         facts = RUNTIME_FACTS.format(
+            tools=", ".join(tool_names or BUILTIN_TOOL_NAMES),
+            external=f"{external.rstrip()}\n" if external.strip() else "",
             workspace=self.workspace,
             max_chars=self.max_output_chars,
             max_lines=self.max_output_lines,
@@ -447,7 +481,78 @@ def build_parser() -> argparse.ArgumentParser:
         default=_env_float("HARNESS_REQUEST_TIMEOUT", 600.0),
         help="HTTP timeout per model request.",
     )
+
+    mcp = p.add_argument_group(
+        "MCP",
+        "Connect to the MCP servers in mcp.json. Off unless MCP_ENABLED=1 is set "
+        "(in .env or the environment) or --mcp is passed.",
+    )
+    toggle = mcp.add_mutually_exclusive_group()
+    toggle.add_argument(
+        "--mcp", dest="mcp", action="store_true", default=None,
+        help="Enable MCP for this run, whatever MCP_ENABLED says.",
+    )
+    toggle.add_argument(
+        "--no-mcp", dest="mcp", action="store_false",
+        help="Disable MCP for this run, whatever MCP_ENABLED says.",
+    )
+    mcp.add_argument(
+        "--mcp-config",
+        default=os.getenv("HARNESS_MCP_CONFIG", "mcp.json"),
+        metavar="PATH",
+        help="Server definitions, in Claude Code's .mcp.json format (default: ./mcp.json).",
+    )
+    mcp.add_argument(
+        "--mcp-state-dir",
+        default=os.getenv("HARNESS_MCP_STATE_DIR", "mcp-state"),
+        metavar="DIR",
+        help=(
+            "Where logins and tokens are kept between runs (default: ./mcp-state). "
+            "In a container, mount it read-write so token refreshes persist."
+        ),
+    )
+    mcp.add_argument(
+        "--mcp-timeout",
+        type=float,
+        default=_env_float("HARNESS_MCP_TIMEOUT", 120.0),
+        metavar="S",
+        help="Default timeout for one MCP tool call (per-server \"timeout\" overrides).",
+    )
+    mcp.add_argument(
+        "--mcp-connect-timeout",
+        type=float,
+        default=_env_float("HARNESS_MCP_CONNECT_TIMEOUT", 30.0),
+        metavar="S",
+        help="How long to wait for all servers to connect at startup.",
+    )
+    mcp.add_argument(
+        "--mcp-login",
+        metavar="SERVER",
+        help="Log in to an OAuth MCP server and store the tokens, then exit.",
+    )
+    mcp.add_argument(
+        "--mcp-logout",
+        metavar="SERVER",
+        help="Forget the stored login for a server, then exit.",
+    )
+    mcp.add_argument(
+        "--mcp-list",
+        action="store_true",
+        help="Connect to every configured server, show what each offers, then exit.",
+    )
+    mcp.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="With --mcp-login: print the URL instead of opening a browser.",
+    )
     return p
+
+
+def mcp_enabled(args: argparse.Namespace) -> bool:
+    """--mcp / --no-mcp, else MCP_ENABLED from the environment or .env."""
+    if args.mcp is not None:
+        return bool(args.mcp)
+    return os.getenv("MCP_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def config_from_args(args: argparse.Namespace) -> Config:
@@ -547,4 +652,9 @@ def config_from_args(args: argparse.Namespace) -> Config:
         label=(args.label or "").strip() or None,
         result_file=anchor(args.result_file) if args.result_file else None,
         quiet=args.quiet,
+        mcp_enabled=mcp_enabled(args),
+        mcp_config=anchor(args.mcp_config),
+        mcp_state_dir=anchor(args.mcp_state_dir),
+        mcp_timeout=max(1.0, args.mcp_timeout),
+        mcp_connect_timeout=max(1.0, args.mcp_connect_timeout),
     )

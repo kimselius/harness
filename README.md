@@ -62,10 +62,11 @@ crontab, a `docker run`. Three things make that safe to rely on.
 | 1 | it failed — the endpoint was unreachable, the request was rejected, or no prompt was given without a terminal |
 | 3 | it ran out of tool rounds (`--max-steps`), so the task is probably half done — `text` holds a closing summary of what did get done |
 | 4 | it ran past `--max-seconds` |
+| 5 | the model's reply was cut off at the output token limit (`--max-tokens`, or the server's own cap), so the answer is incomplete |
 | 130 | Ctrl-C |
 | 143 | SIGTERM (`docker stop`, `timeout`, a supervisor shutting down) |
 
-Only 0 means the model decided it was done. 3 and 4 mean it was cut off
+Only 0 means the model decided it was done. 3, 4 and 5 mean it was cut off
 mid-task — usually a sign the step is trying to do too much.
 
 **The streams are separate.** stdout carries the model's reply and nothing else;
@@ -363,6 +364,8 @@ Worth knowing:
 | `/resume <id>` | load an earlier session (id, prefix, or `last`) |
 | `/limits` | current output limits, timeouts and reasoning settings |
 | `/think [level]` | show or set `reasoning_effort` (`high`, `low`, `off`, …) |
+| `/mcp [help\|…]` | MCP servers, their tools, resources and prompts; login (see [MCP](#mcp)) |
+| `/mcp__<server>__<prompt>` | run a server's prompt as your message |
 | `/exit` | quit (Ctrl-D works too) |
 
 Tab completes command names (`/his` → `/history`) and their arguments: levels for
@@ -509,6 +512,9 @@ credentials into the artifacts that leave it.
 - **Prompt injection is mitigated by instruction only.** A model can be talked out
   of any instruction. Assume anything the agent reads can influence what it does,
   and keep secrets and reachable infrastructure out of the container.
+- **MCP servers act outside the workspace.** Their tools reach real accounts, and
+  their tokens sit in `mcp-state/`, readable by the agent like everything else.
+  See [What MCP changes about security](#what-mcp-changes-about-security).
 - **No command approval, by design.** Nothing prompts before `rm -rf`. A blocklist
   would give a false sense of safety; a throwaway container is the real answer.
 
@@ -657,6 +663,8 @@ so nothing is written outside the checkout:
 | `logs/session-<ts>.jsonl` | one transcript per session (`--log-dir`) |
 | `logs/.harness_history` | REPL line history (lives with the logs, so a read-only source tree still works) |
 | `.env` | credentials and defaults |
+| `mcp.json` | MCP servers (`--mcp-config`) |
+| `mcp-state/` | MCP logins and tokens, `0600` files (`--mcp-state-dir`) |
 
 ## Tools
 
@@ -672,6 +680,10 @@ so nothing is written outside the checkout:
 
 Paths are resolved (symlinks included) and rejected if they fall outside the
 workspace.
+
+With MCP enabled, servers add their own tools next to these, as
+`mcp__<server>__<tool>` — see [MCP](#mcp). The four above are always first and
+cannot be replaced.
 
 ### Two path rules, and the state block
 
@@ -720,6 +732,216 @@ sets it, and the REPL prompt shows it when it is not the root.
 Two more things exist so a wrong path cannot be silent: `write_file` reports any
 directories it had to create (`new directory created: a, a/b`), and a missing file
 reports the path it actually resolved to.
+
+## MCP
+
+The harness is an MCP client. It connects to the servers listed in `mcp.json`,
+gives the model their tools, resources and prompts, and handles the protocol's
+client side: OAuth login, sampling, elicitation, roots, progress and
+cancellation. It is built on the official Python SDK (`mcp` 2.x), which speaks
+both the 2026-07-28 protocol and the handshake-era revisions before it.
+
+**It is off unless you turn it on.** Without `MCP_ENABLED=1` in `.env` (or
+`--mcp`), nothing is connected and the SDK is not even imported: the requests
+the model sees are byte-for-byte what they were before MCP existed. That is the
+switch for small local models, which do badly with dozens of extra tools.
+`--no-mcp` turns it off for one run.
+
+### Configuring servers
+
+`mcp.json`, next to the harness (or `--mcp-config` / `HARNESS_MCP_CONFIG`), in the
+same format as Claude Code's `.mcp.json`, so a server's published setup snippet
+pastes straight in. `mcp.json.example` has one of each kind:
+
+```json
+{
+  "mcpServers": {
+    "linear":   {"type": "http", "url": "https://mcp.linear.app/mcp"},
+    "internal": {"type": "http", "url": "https://mcp.example.com/mcp",
+                 "headers": {"Authorization": "Bearer ${INTERNAL_MCP_TOKEN}"}},
+    "files":    {"command": "npx",
+                 "args": ["-y", "@modelcontextprotocol/server-filesystem", "/srv/data"]}
+  }
+}
+```
+
+`${VAR}` and `${VAR:-default}` are filled from the environment, so secrets live in
+`.env` and `mcp.json` itself can be committed. An unset variable with no default is
+an error naming the server and key, not an empty string. Every expanded value, and
+every header value, is added to the redactor and never reaches a log.
+
+Per-server keys the harness adds (other clients ignore them):
+
+| key | meaning |
+| --- | --- |
+| `enabled` | `false` keeps it in the file but off |
+| `optional` | `true` lets a `-p` run go ahead without it (see below) |
+| `tools` / `disabledTools` | allowlist / denylist of tool names to expose |
+| `timeout` | seconds for one tool call (default `--mcp-timeout`, 120) |
+| `sampling` | `ask` (default), `allow` or `deny` — see below |
+| `oauth` | `false`, or the auth settings described below |
+
+Tools appear to the model as `mcp__<server>__<tool>`, so no server can shadow a
+built-in. While servers are connected the system prompt names them, says plainly
+that their tools act outside the workspace, repeats that what they return is data
+rather than instructions, and includes each server's own `instructions` (capped at
+2000 characters).
+
+### Logging in
+
+A remote server authenticates one of three ways, decided by `mcp.json`:
+
+- **A static header** — `"headers": {"Authorization": "Bearer ${TOKEN}"}`. Nothing
+  else to do, nothing stored.
+- **A machine grant** — `"oauth": {"grant": "client_credentials", "clientId": …,
+  "clientSecret": …, "issuer": …}` (or `"private_key_jwt"` with `privateKeyFile`).
+  Fully headless: the harness fetches a token itself, caches it, and fetches a new
+  one when it expires. No login step.
+- **OAuth login** — the default for an HTTP server with no `Authorization` header.
+  Log in once:
+
+```sh
+python3 main.py --mcp-login linear
+```
+
+That runs the full flow: discovery, dynamic client registration (or a client you
+pre-registered via `oauth.clientId`), PKCE, and the RFC 8707 resource binding. It
+prints the authorization URL, tries to open a browser, and waits for the redirect
+two ways at once: a listener on `localhost:33418` (`oauth.callbackPort` to change
+it), and **you pasting the address the browser ended on**. The paste is what makes
+login work in a container or over SSH: the browser cannot reach the listener, so
+it ends on a page that fails to load — copy that page's address and paste it.
+`--no-browser` just prints the URL.
+
+Tokens go to `mcp-state/<server>.json` (`0600`, directory `0700`; change with
+`--mcp-state-dir` / `HARNESS_MCP_STATE_DIR`). Every later run, `-p` included, uses
+them and **refreshes them when they expire**, writing the rotated tokens back. The
+file also remembers when the token expires and where the token endpoint is, which
+the SDK alone forgets between processes: without that, a fresh process sends an
+expired token, gets a 401, and asks for a new login instead of refreshing.
+
+Stored tokens are bound to the server URL: point the same name at another URL and
+they are not sent there. `--mcp-logout <server>` forgets a login; `--mcp-list`
+connects to everything and shows the auth state, token expiry and what each server
+offers. These three work whether or not `MCP_ENABLED` is set.
+
+### Unattended runs
+
+A run never starts an interactive login. In `-p` mode, if any enabled server
+cannot connect — not logged in, refresh refused, unreachable, broken `mcp.json` —
+the run stops **before the model is called**, exit 1, with the reason on stderr and
+in `--result-file`:
+
+```
+! MCP unavailable: linear: not logged in — run: harness --mcp-login linear
+```
+
+A pipeline step written around a server would otherwise run without it and quietly
+do something else. Mark a server `"optional": true` when the run should go ahead
+anyway. In the REPL a failed server is a warning, and `/mcp login <server>` fixes
+it in place.
+
+A server prompt can be the `-p` message itself, which lets a pipeline step use a
+prompt a server maintains:
+
+```sh
+python3 main.py -p "/mcp__github__review_pr 1432"
+```
+
+### When a server needs you
+
+Some servers call back into the client mid-call:
+
+- **Sampling** — the server asks to use *your* model. `ask` (the default) shows
+  what it wants and waits for y/N; `allow` and `deny` decide without asking. In
+  `-p` there is nobody to ask, so `ask` means no. Approved requests run through
+  the same client, are logged with `purpose: sampling`, and count toward the
+  session's tokens. Servers that run their own small tool loop inside sampling
+  are supported.
+- **Elicitation** — the server asks you a question: a form (each field prompted and
+  validated: strings, numbers, booleans, choices) or a URL to visit. In `-p` it is
+  always declined.
+- **Roots** — servers are told the workspace is the root they may work in.
+
+These happen during a tool call, while the steering input is watching stdin and a
+status line is ticking, so both are paused while you answer and resumed after.
+
+### In the REPL
+
+`/mcp` shows each server's state, auth and counts. `/mcp tools <server>` lists
+every tool it offers, including the ones your allowlist hides. Also: `/mcp
+resources`, `/mcp prompts`, `/mcp login|logout|reconnect <server>`. Server prompts
+are commands — `/mcp__<server>__<prompt> arg…`, positional or `name=value`, with
+Tab completing names and, where the server supports it, argument values.
+
+Resources are offered to the model as two tools, `mcp__list_resources` and
+`mcp__read_resource`, added only when a connected server has any. Results are
+text: an image, audio or binary resource is described (`[image/png image, 48 KB —
+not shown]`), since there is no vision path here.
+
+When a server changes its tool list mid-session, the model sees the new list on its
+next request. A server whose tool definitions differ from what it advertised on the
+previous run gets a warning at connect — a reviewed server that quietly rewrites its
+own tool descriptions later is the classic way to slip instructions to a model.
+
+Server stderr and SDK diagnostics go to `logs/<session>.mcp.log`, never the
+terminal. The JSONL log gets `mcp_connect` (protocol, counts, schema size, tool-list
+hash), `mcp_tools_changed`, `mcp_log`, `mcp_sampling_*` and `mcp_elicitation`
+events, and every `tool_call` of an MCP tool carries a `server` field.
+
+### In a container
+
+The image includes the SDK (about 26 MB, mostly `cryptography`). Two things to mount:
+
+```sh
+docker run --rm --env-file .env -e MCP_ENABLED=1 \
+  -v "$PWD/mcp.json":/harness/mcp.json:ro \
+  -v harness-mcp:/harness/mcp-state \
+  -v "$PWD/workspace":/ws -e HARNESS_WORKSPACE=/ws \
+  harness -p "do a thing"
+```
+
+The state directory must be **read-write**: a token refresh writes back to it, and
+with a read-only mount every run would succeed until the first access token
+expired. A named volume picks up the image's ownership (uid 1001, mode 0700) on
+first use, so no `chown` is needed.
+
+Logging in, either way works:
+
+```sh
+# on the host, into a directory you then mount
+python3 main.py --mcp-login linear --mcp-state-dir ./mcp-state
+# or inside the container: open the URL anywhere, paste the address you land on
+docker run -it --rm -v "$PWD/mcp.json":/harness/mcp.json:ro \
+  -v harness-mcp:/harness/mcp-state harness --mcp-login linear --no-browser
+```
+
+stdio servers run inside the container, so their runtime has to be in the image —
+`FROM harness`, then install node or uv and the server itself at build time. `npx
+-y` at run time needs a writable `HOME` and egress to the package registry, which a
+locked-down container does not have. stdio servers get only `HOME`, `PATH`,
+`SHELL`, `TERM`, `USER`, `LOGNAME`, the proxy variables, and their own `env` from
+`mcp.json` — never the harness's API key.
+
+For the hardened stack: every HTTP server needs an allowlist entry for its own host
+**and** its authorization server's host, since token refresh goes there. A server
+the proxy refuses fails the run cleanly (`MCP unavailable: … error response`), and
+the proxy log names it. See `examples/hardened/README.md`.
+
+### What MCP changes about security
+
+The [Security](#security) section's boundary still holds — the container is it —
+but MCP moves two things:
+
+- **"Nothing outside the workspace is reachable" stops being true.** MCP tools act
+  on real accounts and services by design. The system prompt says so while servers
+  are connected.
+- **Tokens are readable by the agent**, the same way the harness's own API key is:
+  same uid, and `mcp-state/` is a directory it can `cat`. They are kept out of the
+  logs, the result file and the shell's environment, and the harness warns if the
+  state directory is inside the workspace — but that stops accidents, not a
+  determined agent. Give each server **the narrowest token or scopes it will
+  accept**, and treat a container that ran with a token as having seen it.
 
 ## Output limits
 
@@ -1052,6 +1274,11 @@ main.py      CLI + REPL, exit codes, result file, signal handling
 agent.py     tool loop, truncation, compaction, history repair, Outcome
 llm.py       OpenAI-compatible client (streaming + non-streaming)
 tools.py     shell / read_file / write_file / edit_file + JSON schemas
+toolset.py   the tools one agent can call: built-ins plus MCP, one registry
+mcp_config.py  mcp.json parsing, ${VAR} expansion, validation
+mcp_client.py  MCP runtime: SDK on a background loop, tools, callbacks
+mcp_auth.py    token store, OAuth providers, --mcp-login flow
+mcp_cli.py     /mcp, --mcp-list, prompts as commands, answering servers
 session.py   per-run state: working directory and token totals
 context.py   token metering, split points, summary prompt, harness notes
 sessions.py  session discovery, listing, replay from the log
@@ -1079,6 +1306,14 @@ examples/hardened/ locked-down container + egress allowlist
 - `--max-seconds` is checked between tool rounds, not inside one. A command already
   running is bounded by `--shell-timeout` instead, so the worst case is one
   command's timeout past the deadline.
+- MCP results are text. Images, audio and binary resources are described, not
+  shown, because the harness has no vision path.
+- MCP resource subscriptions are not used: a turn-based loop has nothing to consume
+  update events between turns. `mcp__read_resource` reads the current state.
+- A run never logs in interactively. An OAuth server whose refresh token has been
+  revoked or has expired fails unattended runs until someone runs `--mcp-login`.
+- Behind the hardened proxy, a refused MCP host surfaces as the SDK's generic
+  "error response"; the proxy log is where the host name is.
 - There is no pipeline runner inside the harness. Chaining is a shell script
   (`examples/report/run.sh`), which also means no way to re-run "step 4 onwards"
   except by what the script itself offers.

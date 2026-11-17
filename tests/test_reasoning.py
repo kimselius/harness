@@ -337,6 +337,71 @@ def test_printer_streams() -> None:
     check("answer still shown", "visible" in out.getvalue())
 
 
+def test_stream_usage_survives_other_rejections(tmp: Path, base_url: str) -> None:
+    print("streaming: a 400 about something else keeps usage reporting on")
+    mock_server.reset()
+    mock_server.set_script([("ok anyway", [])])
+    mock_server.REJECT.add("reasoning_effort")
+    agent = make_agent(tmp / "stream-reject", base_url,
+                       ["--reasoning-effort", "high"])
+    with common.capture():
+        final = agent.run("hello")
+    check("turn succeeded", final == "ok anyway", final)
+    check("stream usage still requested", agent.llm.supports_stream_usage)
+    check("last request still asked for usage",
+          "stream_options" in mock_server.REQUESTS[-1],
+          str(mock_server.REQUESTS[-1].keys()))
+    check("usage reported", agent.last_usage is not None)
+    check("effort dropped instead", not agent.llm.supports_effort)
+
+    print("streaming: a server that rejects stream_options")
+    mock_server.reset()
+    mock_server.set_script([("fine", [])])
+    mock_server.REJECT.add("stream_options")
+    agent = make_agent(tmp / "stream-opts", base_url)
+    with common.capture():
+        final = agent.run("hello")
+    check("turn succeeded", final == "fine", final)
+    check("stream usage turned off", not agent.llm.supports_stream_usage)
+    check("retried without it", "stream_options" not in mock_server.REQUESTS[-1])
+    mock_server.reset()
+
+
+def test_two_fields_rejected_one_at_a_time(tmp: Path, base_url: str) -> None:
+    print("a server that rejects two fields, naming one per error")
+    mock_server.reset()
+    mock_server.set_script([("got there", [])])
+    mock_server.REJECT.update({"reasoning_effort", "top_k"})
+    agent = make_agent(tmp / "two-rejects", base_url,
+                       ["--reasoning-effort", "high", "--extra-body",
+                        '{"top_k": 40}', "--no-stream"])
+    with common.capture():
+        final = agent.run("hello")
+    check("turn succeeded after two drops", final == "got there", final)
+    check("three attempts", len(mock_server.REQUESTS) == 3,
+          str(len(mock_server.REQUESTS)))
+    dropped = [r["fields"] for r in records(agent) if r["type"] == "params_dropped"]
+    check("each field dropped once",
+          dropped == [["reasoning_effort"], ["top_k"]], str(dropped))
+    mock_server.reset()
+
+
+def test_per_call_max_tokens(tmp: Path, base_url: str) -> None:
+    print("max_tokens can be overridden for one call")
+    mock_server.reset()
+    mock_server.set_script([("ok", [])])
+    agent = make_agent(tmp / "maxtok", base_url, ["--max-tokens", "500", "--no-stream"])
+    messages = [{"role": "user", "content": "hi"}]
+    agent.llm.complete(messages, None, purpose="sampling", max_tokens=64)
+    check("override sent", mock_server.REQUESTS[-1].get("max_tokens") == 64,
+          str(mock_server.REQUESTS[-1].get("max_tokens")))
+    agent.llm.complete(messages, None)
+    check("configured value otherwise",
+          mock_server.REQUESTS[-1].get("max_tokens") == 500,
+          str(mock_server.REQUESTS[-1].get("max_tokens")))
+    mock_server.reset()
+
+
 def main_() -> int:
     server, base_url = mock_server.start()
     with tempfile.TemporaryDirectory() as raw:
@@ -351,6 +416,9 @@ def main_() -> int:
         test_extra_body(tmp, base_url)
         test_graceful_degradation(tmp, base_url)
         test_unrelated_400_is_not_blamed_on_parameters(tmp, base_url)
+        test_stream_usage_survives_other_rejections(tmp, base_url)
+        test_two_fields_rejected_one_at_a_time(tmp, base_url)
+        test_per_call_max_tokens(tmp, base_url)
         test_model_change_resets_calibration(tmp, base_url)
         test_progress_through_silent_phases()
         test_printer_streams()

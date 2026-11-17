@@ -32,25 +32,35 @@ def new_id() -> str:
     return f"{stamp}-{uuid.uuid4().hex[:6]}"
 
 
-def session_files(log_dir: Path) -> list[Path]:
-    """Session logs, newest first."""
+def session_files(log_dir: Path, exclude: Path | None = None) -> list[Path]:
+    """Session logs, newest first, leaving out `exclude` if given."""
     if not log_dir.is_dir():
         return []
-    files = [p for p in log_dir.glob(f"*{SESSION_SUFFIX}") if p.is_file()]
+    skip = exclude.resolve() if exclude else None
+    files = [
+        p
+        for p in log_dir.glob(f"*{SESSION_SUFFIX}")
+        if p.is_file() and p.resolve() != skip
+    ]
     return sorted(files, key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
 
 
-def resolve(log_dir: Path, token: str) -> Path:
+def resolve(log_dir: Path, token: str, exclude: Path | None = None) -> Path:
     """Turn a user-supplied session reference into a log path.
 
     Accepts "last", a full session id, an id prefix, or a path to a log file.
+    `exclude` is the session already running: from inside the REPL its own log
+    is always the newest file, so without it "last" would resolve to itself.
     """
     token = (token or "").strip()
-    files = session_files(log_dir)
+    files = session_files(log_dir, exclude=exclude)
     if not token or token in LATEST:
-        if not files:
-            raise SessionError(f"no sessions found in {log_dir}")
-        return files[0]
+        # A launch that never got a message (opened and closed, or left behind
+        # by an earlier /resume) has nothing to restore, so "last" skips it.
+        for path in files:
+            if has_conversation(path):
+                return path
+        raise SessionError(f"no sessions with any messages in {log_dir}")
 
     direct = Path(token).expanduser()
     if direct.is_file():
@@ -79,6 +89,11 @@ def _records(path: Path):
                 yield json.loads(line)
             except json.JSONDecodeError:
                 continue
+
+
+def has_conversation(path: Path) -> bool:
+    """Whether the log holds at least one user message. Stops at the first."""
+    return any(record.get("type") == "user_message" for record in _records(path))
 
 
 def last_seq(path: Path) -> int:
@@ -153,6 +168,16 @@ def load_history(
         if kind == "user_message":
             history.append({"role": "user", "content": record.get("content") or ""})
 
+        elif kind == "history_reset":
+            history = []
+
+        elif kind == "llm_response" and record.get("purpose") == "wrapup":
+            # The closing summary after the step limit. Offered no tools, and any
+            # it asked for anyway were never run, so none are stored.
+            content = record.get("content") or ""
+            if content.strip():
+                history.append({"role": "assistant", "content": content})
+
         elif kind == "llm_response" and record.get("purpose", "turn") == "turn":
             message: dict[str, Any] = {
                 "role": "assistant",
@@ -183,6 +208,25 @@ def load_history(
                     "content": clamped,
                 }
             )
+
+        elif kind == "history_repaired":
+            # The answers repair invented for unanswered calls. Older logs did
+            # not record which calls; the repair after loading covers those.
+            reason = record.get("reason") or "interrupted by user"
+            for call_id in record.get("ids") or []:
+                history.append(
+                    {"role": "tool", "tool_call_id": call_id, "content": f"ERROR: {reason}"}
+                )
+
+        elif kind == "deadline_reached":
+            history.append(
+                {"role": "user", "content": context.deadline_note(record.get("limit", 0))}
+            )
+
+        elif kind == "session_restored":
+            # restore() appends this note only when there was history to restore.
+            if history:
+                history.append({"role": "user", "content": context.RESUME_NOTE})
 
         elif kind == "interrupted":
             history.append({"role": "user", "content": context.INTERRUPT_NOTE})

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 from openai import BadRequestError, OpenAI
@@ -32,6 +33,16 @@ def _extra(obj: Any, names: tuple[str, ...]) -> str:
         if isinstance(value, str) and value:
             return value
     return ""
+
+
+def _fallback_id() -> str:
+    """Id for a tool call the server sent without one.
+
+    Must be unique across the whole session, not just the reply: history repair
+    matches results to calls by id, and a `call_0` repeated every step would let
+    an old answer stand in for a missing one.
+    """
+    return f"call_{uuid.uuid4().hex[:12]}"
 
 
 def reasoning_tokens(usage: dict[str, Any] | None) -> int | None:
@@ -115,6 +126,7 @@ class LLM:
         tools: list[dict] | None,
         model: str | None = None,
         effort: str | None = INHERIT,
+        max_tokens: int | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "model": model or self.cfg.model,
@@ -124,8 +136,11 @@ class LLM:
             params["tools"] = tools
         if self.cfg.temperature is not None:
             params["temperature"] = self.cfg.temperature
-        if self.cfg.max_tokens is not None:
-            params["max_tokens"] = self.cfg.max_tokens
+        # A per-call cap (an MCP sampling request carries its own) replaces the
+        # configured one for that call only.
+        cap = max_tokens if max_tokens is not None else self.cfg.max_tokens
+        if cap is not None:
+            params["max_tokens"] = cap
 
         chosen = self.cfg.reasoning_effort if effort == INHERIT else effort
         if chosen and self.supports_effort:
@@ -182,6 +197,7 @@ class LLM:
         effort: str | None = INHERIT,
         on_reasoning: Any = None,
         on_tool_args: Any = None,
+        max_tokens: int | None = None,
     ) -> Reply:
         """One model call.
 
@@ -189,9 +205,12 @@ class LLM:
         on_tool_args(name, chars_so_far) fires as a tool call is assembled, which
         is otherwise an invisible wait: the arguments of a write_file can be tens
         of thousands of characters and none of it reaches the other callbacks.
-        Pass effort=None to send no reasoning_effort for this call.
+        Pass effort=None to send no reasoning_effort for this call, and
+        max_tokens to override --max-tokens for this call only.
         """
-        params = self._params(messages, tools, model=model, effort=effort)
+        params = self._params(
+            messages, tools, model=model, effort=effort, max_tokens=max_tokens
+        )
         self.log.event(
             "llm_request",
             model=params["model"],
@@ -201,20 +220,24 @@ class LLM:
             messages=messages,
             tool_names=[t["function"]["name"] for t in tools or []],
         )
-        try:
-            reply = self._dispatch(params, on_text, on_reasoning, on_tool_args)
-        except BadRequestError as exc:
-            # Some OpenAI-compatible servers reject reasoning_effort outright.
-            # Drop the fields they name and retry once, rather than failing the
-            # turn — but only when the error actually blames one of them.
-            retry = self._without_unsupported(params, exc)
-            if retry is None:
+        # Some OpenAI-compatible servers reject reasoning_effort or an extra_body
+        # field outright. Drop the fields they name and retry, rather than
+        # failing the turn — but only when the error actually blames one of them.
+        # Two retries: a server that rejects both usually names one per error.
+        attempt = params
+        for retries_left in (2, 1, 0):
+            try:
+                reply = self._dispatch(attempt, on_text, on_reasoning, on_tool_args)
+                break
+            except BadRequestError as exc:
+                retry = self._without_unsupported(attempt, exc) if retries_left else None
+                if retry is None:
+                    self.log.event("llm_error", error=f"{type(exc).__name__}: {exc}")
+                    raise
+                attempt = retry
+            except Exception as exc:
                 self.log.event("llm_error", error=f"{type(exc).__name__}: {exc}")
                 raise
-            reply = self._dispatch(retry, on_text, on_reasoning, on_tool_args)
-        except Exception as exc:
-            self.log.event("llm_error", error=f"{type(exc).__name__}: {exc}")
-            raise
 
         self.log.event(
             "llm_response",
@@ -245,11 +268,11 @@ class LLM:
         choice = response.choices[0]
         calls = [
             {
-                "id": tc.id or f"call_{i}",
+                "id": tc.id or _fallback_id(),
                 "name": tc.function.name or "",
                 "arguments": tc.function.arguments or "{}",
             }
-            for i, tc in enumerate(choice.message.tool_calls or [])
+            for tc in choice.message.tool_calls or []
         ]
         usage = response.usage.model_dump() if response.usage else None
         return Reply(
@@ -269,13 +292,18 @@ class LLM:
             kwargs["stream_options"] = {"include_usage": True}
         try:
             stream = self.client.chat.completions.create(**kwargs)
-        except Exception:
-            if not self.supports_stream_usage:
-                raise
+        except BadRequestError:
             # Some compatible servers reject stream_options; retry without it once.
-            self.supports_stream_usage = False
-            kwargs.pop("stream_options", None)
+            # Only a 400 can mean that: a timeout or a dropped connection has
+            # already been retried by the SDK and says nothing about the field.
+            if "stream_options" not in kwargs:
+                raise
+            kwargs.pop("stream_options")
             stream = self.client.chat.completions.create(**kwargs)
+            # Only now is it known that stream_options was the problem. If the
+            # retry had failed too, the 400 was about something else (often
+            # reasoning_effort, which complete() handles) and usage stays on.
+            self.supports_stream_usage = False
 
         text_parts: list[str] = []
         thought_parts: list[str] = []
@@ -337,11 +365,11 @@ class LLM:
 
         calls = [
             {
-                "id": slot["id"] or f"call_{index}",
+                "id": slot["id"] or _fallback_id(),
                 "name": slot["name"],
                 "arguments": slot["arguments"] or "{}",
             }
-            for index, slot in sorted(slots.items())
+            for _, slot in sorted(slots.items())
         ]
         return Reply(
             "".join(text_parts), calls, usage, finish_reason,

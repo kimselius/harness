@@ -241,6 +241,27 @@ def test_repl_command(tmp: Path) -> None:
     check("/cwd .. is clamped to the root", session.cwd == cfg.workspace, str(session.cwd))
 
 
+def test_no_stdin(tmp: Path) -> None:
+    print("commands get no stdin")
+    import time
+
+    cfg, session = make_cfg(tmp / "stdin")
+    # Whatever the harness's own stdin is (a terminal in the REPL), a command
+    # must not inherit it: it would compete with the REPL for keystrokes.
+    probe = (
+        f"{sys.executable!s} -c \"import os; "
+        "print('devnull' if os.fstat(0).st_rdev == os.stat('/dev/null').st_rdev "
+        "else 'inherited')\""
+    )
+    check("stdin is /dev/null", body(sh(cfg, session, probe)) == "devnull",
+          body(sh(cfg, session, probe)))
+    started = time.monotonic()
+    result = sh(cfg, session, 'read x; echo "rc=$?"', timeout=10)
+    check("read fails at once instead of waiting",
+          time.monotonic() - started < 5, f"{time.monotonic() - started:.1f}s")
+    check("read saw end of input", "rc=1" in body(result), body(result))
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
@@ -254,6 +275,7 @@ def main() -> int:
         test_interrupt_keeps_cwd(tmp)
         test_missing_cwd(tmp)
         test_repl_command(tmp)
+        test_no_stdin(tmp)
     return common.report()
 
 

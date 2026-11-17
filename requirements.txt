@@ -1,1 +1,3 @@
 openai>=1.40,<3
+# MCP client (only imported when MCP_ENABLED is set).
+mcp>=2.3,<3

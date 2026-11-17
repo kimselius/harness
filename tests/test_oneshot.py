@@ -27,7 +27,15 @@ import mock_server  # noqa: E402
 from common import check  # noqa: E402
 
 import main as cli  # noqa: E402
-from agent import ERROR, INTERRUPTED, MAX_STEPS, OK, TIMEOUT, Outcome  # noqa: E402
+from agent import (  # noqa: E402
+    ERROR,
+    INTERRUPTED,
+    MAX_STEPS,
+    OK,
+    TIMEOUT,
+    TRUNCATED,
+    Outcome,
+)
 
 ENV = {**os.environ, "OPENAI_API_KEY": "x"}
 
@@ -72,6 +80,19 @@ def test_exit_codes(tmp: Path, base_url: str) -> None:
     walled = run(tmp / "wall", base_url, "-p", "loop", "--max-steps", "2")
     check("hitting --max-steps is 3", walled.returncode == 3, str(walled.returncode))
     check("said why", "max-steps" in walled.stderr, walled.stderr[-200:])
+
+    # A reply cut off at the output token limit is not a finished answer, even
+    # though the model made no tool call.
+    mock_server.reset()
+    mock_server.set_script([("half an ans", [])])
+    mock_server.FINISH_REASON.append("length")
+    cut = run(tmp / "cut", base_url, "-p", "explain")
+    check("a reply cut off at the token limit is 5", cut.returncode == 5,
+          str(cut.returncode))
+    check("the partial text is still on stdout", "half an ans" in cut.stdout,
+          repr(cut.stdout))
+    check("said why", "token limit" in cut.stderr, cut.stderr[-200:])
+    mock_server.reset()
 
 
 def test_no_prompt_without_a_terminal(tmp: Path) -> None:
@@ -302,7 +323,9 @@ def test_label(tmp: Path, base_url: str) -> None:
 # -- the exit-code mapping itself -------------------------------------------
 def test_exit_code_mapping() -> None:
     print("status to exit code")
-    for status, expected in [(OK, 0), (ERROR, 1), (MAX_STEPS, 3), (TIMEOUT, 4)]:
+    for status, expected in [
+        (OK, 0), (ERROR, 1), (MAX_STEPS, 3), (TIMEOUT, 4), (TRUNCATED, 5)
+    ]:
         check(f"{status} is {expected}",
               cli.exit_code(Outcome(status=status)) == expected)
     check("an unknown status is a failure, not a success",

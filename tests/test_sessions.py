@@ -357,6 +357,121 @@ def test_resume_shows_the_conversation(tmp: Path, base_url: str) -> None:
           screen.index("harness") < screen.index("remember the pelican"), screen[:160])
 
 
+def test_resume_last_skips_itself(tmp: Path, base_url: str) -> None:
+    print("/resume last from inside a session")
+    mock_server.set_script([("done", [])])
+    earlier = make_agent(tmp / "rl", base_url)
+    earlier.run("earlier work")
+    time.sleep(0.02)
+    # A launch that never got a message: the REPL opened and closed, or the log
+    # an earlier /resume left behind. It is the newest file, and it is empty.
+    empty = make_agent(tmp / "rl", base_url)
+    log_dir = earlier.cfg.log_path.parent
+    check("last skips a session with no messages",
+          sessions.resolve(log_dir, "last") == earlier.cfg.log_path)
+    time.sleep(0.02)
+    current = make_agent(tmp / "rl", base_url)
+    current.run("current work")
+    check("without exclude, the running session is newest",
+          sessions.resolve(log_dir, "last") == current.cfg.log_path)
+    check("excluding the running session gives the one before it",
+          sessions.resolve(log_dir, "last", exclude=current.cfg.log_path)
+          == earlier.cfg.log_path)
+    listed = sessions.session_files(log_dir, exclude=current.cfg.log_path)
+    check("listing leaves the running session out",
+          current.cfg.log_path not in listed and earlier.cfg.log_path in listed)
+    check("an empty launch is still listed (only last skips it)",
+          empty.cfg.log_path in listed)
+    try:
+        sessions.resolve(log_dir, "last", exclude=earlier.cfg.log_path)
+        check("nothing else resumable is reported", True)
+    except sessions.SessionError:
+        check("nothing else resumable is reported", False, "current has messages")
+
+    import main as cli
+    from logbook import Logbook  # noqa: F401
+
+    with common.capture() as cap:
+        cli.cmd_resume(current, "last")
+    check("/resume last switches to the earlier session",
+          current.cfg.log_path == earlier.cfg.log_path, cap.err[-200:])
+    check("not 'already in that session'", "already" not in cap.err, cap.err)
+    check("earlier conversation loaded",
+          any(m.get("content") == "earlier work" for m in current.history))
+
+
+def test_replay_tracks_every_history_change(tmp: Path, base_url: str) -> None:
+    print("replay follows reset, wrap-up, deadline, interrupt, resume, compaction")
+    import os
+    import signal
+    import threading
+
+    import main as cli
+
+    agent = make_agent(tmp / "every", base_url, ["--max-steps", "1"])
+
+    def same(label: str) -> dict:
+        history, stats = sessions.load_history(
+            agent.cfg.log_path, agent.cfg.max_output_chars, agent.cfg.max_output_lines
+        )
+        check(f"replay matches {label}", history == agent.history,
+              f"{[m['role'] for m in history]} vs "
+              f"{[m['role'] for m in agent.history]}")
+        return stats
+
+    mock_server.set_script([("one", [])])
+    with common.capture():
+        agent.run("first")
+        agent.reset()
+    same("after /reset")
+    check("reset really cleared it", agent.history == [])
+
+    mock_server.set_script([("", [("shell", {"command": "true"})]), ("wrapped up", [])])
+    with common.capture():
+        agent.run("loop")
+    check("wrap-up ran", agent.history[-1]["content"] == "wrapped up")
+    same("after the step-limit wrap-up")
+
+    agent.cfg.max_seconds = 1e-9
+    with common.capture():
+        agent.run("slow")
+    agent.cfg.max_seconds = 0
+    same("after the deadline")
+
+    mock_server.set_script([
+        ("", [("shell", {"command": "sleep 30"}), ("shell", {"command": "true"})])
+    ])
+    timer = threading.Timer(1.0, lambda: os.kill(os.getpid(), signal.SIGINT))
+    timer.daemon = True
+    timer.start()
+    with common.capture():
+        agent.run("interrupt me")
+    check("second call answered without running",
+          "not run" in agent.history[-2]["content"], agent.history[-2]["content"])
+    same("after an interrupt with a skipped call")
+
+    cli.restore(agent)
+    check("resume note present", agent.history[-1]["content"] == context.RESUME_NOTE)
+    same("after a resume")
+
+    mock_server.set_script([("record of what happened", [])])
+    agent.cfg.compact_keep = 0.00001  # keep almost nothing, summarize the rest
+    with common.capture():
+        compacted = agent.compact(reason="test")
+    check("compaction happened", compacted)
+    stats = same("after compaction")
+    check("compaction replayed, not ignored",
+          stats["compactions_applied"] == 1 and stats["compactions_ignored"] == 0,
+          str(stats))
+
+    stats = cli.restore(agent)
+    check("second resume replays the compaction",
+          stats["compactions_applied"] == 1 and stats["compactions_ignored"] == 0,
+          str(stats))
+    same("after a second resume")
+    check("pairing valid throughout", pairing_ok(agent.history))
+
+
 def main_() -> int:
     server, base_url = mock_server.start()
     with tempfile.TemporaryDirectory() as raw:
@@ -364,6 +479,8 @@ def main_() -> int:
         test_ids()
         test_file_is_the_session(tmp, base_url)
         test_resolve(tmp, base_url)
+        test_resume_last_skips_itself(tmp, base_url)
+        test_replay_tracks_every_history_change(tmp, base_url)
         test_replay_matches(tmp, base_url)
         test_replay_truncates_with_current_limits(tmp, base_url)
         test_replay_honours_compaction(tmp, base_url)

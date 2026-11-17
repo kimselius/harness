@@ -394,6 +394,34 @@ def test_warns_when_compaction_did_not_help(tmp: Path, base_url: str) -> None:
               "still at" not in cap.err, cap.err)
 
 
+def test_trim_keeps_pinned_and_summary(tmp: Path, base_url: str) -> None:
+    print("trim drops from the tail, never the pinned request or the summary")
+    mock_server.reset()
+    agent = make_agent(tmp / "trimpin", base_url, ["--context-tokens", "4000"])
+    pinned = {"role": "user", "content": "the original job: " + "j" * 900}
+    summary = context.summary_message("record of earlier work")
+    # Each message is under the shrink floor, so trimming has to drop, not
+    # shrink. That is the path that used to pop index 1: the summary itself.
+    tail = []
+    for i in range(30):
+        role = "user" if i % 2 == 0 else "assistant"
+        tail.append({"role": role, "content": f"m{i} " + "t" * 1000})
+    agent.history = [pinned, summary, *tail]
+    agent._trim_to_fit()
+    check("trimmed under threshold",
+          agent.used_tokens() < agent.cfg.compact_threshold, str(agent.used_tokens()))
+    check("pinned request still first", agent.history[0] is pinned,
+          str(agent.history[0])[:80])
+    check("summary still second",
+          agent.history[1]["content"].startswith(context.SUMMARY_HEADER),
+          str(agent.history[1])[:80])
+    check("newest message kept", agent.history[-1]["content"].startswith("m29 "))
+    check("oldest tail message dropped first",
+          not any(m["content"].startswith("m0 ") for m in agent.history))
+    check("drop logged", any(r["type"] == "history_trimmed" for r in records(agent)))
+    check("pairing intact", pairing_ok(agent.history))
+
+
 def main() -> int:
     server, base_url = mock_server.start()
     with tempfile.TemporaryDirectory() as raw:
@@ -406,6 +434,7 @@ def main() -> int:
         test_summary_failure(tmp, base_url)
         test_disabled(tmp, base_url)
         test_trim_guard(tmp, base_url)
+        test_trim_keeps_pinned_and_summary(tmp, base_url)
         test_shrink_before_drop(tmp, base_url)
         test_task_survives_compaction(tmp, base_url)
         test_progress_reporting(tmp, base_url)

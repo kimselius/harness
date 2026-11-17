@@ -14,6 +14,9 @@ workspace/
 # REPL line history.
 .harness_history
 
+# MCP logins: OAuth tokens and client registrations, one file per server.
+mcp-state/
+
 # Local system prompt. PROMPT.md.example is tracked; commit your own with
 # `git add -f PROMPT.md` if you want it versioned.
 PROMPT.md

@@ -10,6 +10,9 @@ __pycache__/
 logs/
 workspace/
 .harness_history
+# MCP logins and tokens. Mounted at run time, never part of an image.
+mcp-state/
+mcp.json
 
 .git/
 .gitignore
